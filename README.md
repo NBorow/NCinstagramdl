@@ -25,10 +25,12 @@ A tool for managing and downloading Instagram data dumps, including future suppo
    - `emoji`
    - `chardet`
    - `python-dateutil`
+   - `selenium`
+   - `webdriver-manager`
    
    Install them with:
    ```sh
-   pip install requests beautifulsoup4 lxml tqdm pytz dateparser emoji chardet python-dateutil
+   pip install requests beautifulsoup4 lxml tqdm pytz dateparser emoji chardet python-dateutil selenium webdriver-manager
    ```
 
 ## Configuration
@@ -38,7 +40,18 @@ Create a `config.txt` file in the project root with the following contents (edit
 ```
 PROFILE_DUMP_DIRECTORY=C:\example_directory
 DOWNLOAD_DIRECTORY=C:\example_directory2
+# Optional: Instagram login credentials for DM download/verification
+# USERNAME=your_instagram_username
+# PASSWORD=your_instagram_password
 ```
+
+### Login Credentials Behavior
+- If both `USERNAME` and `PASSWORD` are present in `config.txt`, the script will attempt to log in with them.
+- If only `USERNAME` is present, you will be prompted for the password at runtime.
+- If only `PASSWORD` is present (but not `USERNAME`), the script will ignore the password and prompt for both username and password.
+- If neither is present, you will be prompted for both.
+- The script will verify the credentials by attempting a headless login to Instagram before proceeding. If the login fails, you will be prompted to re-enter your credentials.
+- **Do not use quotes** around the username or password in `config.txt`.
 
 ## Downloading Your Instagram Data
 
@@ -55,7 +68,7 @@ From the project directory, run:
 python ncinstagramdl.py
 ```
 
-Follow the on-screen prompts to select and process your Instagram data dump.
+Follow the on-screen prompts to log in (if needed), select and process your Instagram data dump, and choose available download options.
 
 ---
 
