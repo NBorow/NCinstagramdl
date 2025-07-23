@@ -9,6 +9,48 @@ from webdriver_manager.chrome import ChromeDriverManager
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 PAGE_SIZE = 10
 
+# --- New: Profile dump scan logic ---
+PROFILE_POSTS_PATH = os.path.join('your_instagram_activity', 'media', 'posts_1.json')
+LIKED_PATH = os.path.join('your_instagram_activity', 'likes', 'liked_posts.json')
+SAVED_COLLECTIONS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_collections.json')
+SAVED_POSTS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_posts.json')
+DM_INBOX_PATH = os.path.join('your_instagram_activity', 'messages', 'inbox')
+
+# Helper to check if a file exists and is non-empty
+def file_exists_nonempty(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+def scan_profile_dump(dump_path):
+    """
+    Returns a dict: {'p': bool, 'l': bool, 's': bool, 'd': bool}
+    """
+    result = {'p': False, 'l': False, 's': False, 'd': False}
+    # Profile Posts
+    posts_json = os.path.join(dump_path, PROFILE_POSTS_PATH)
+    if file_exists_nonempty(posts_json):
+        result['p'] = True
+    # Liked
+    liked_json = os.path.join(dump_path, LIKED_PATH)
+    if file_exists_nonempty(liked_json):
+        result['l'] = True
+    # Saved
+    saved_collections_json = os.path.join(dump_path, SAVED_COLLECTIONS_PATH)
+    saved_posts_json = os.path.join(dump_path, SAVED_POSTS_PATH)
+    if file_exists_nonempty(saved_collections_json) or file_exists_nonempty(saved_posts_json):
+        result['s'] = True
+    # DMs: any message_1.json in any subfolder of inbox
+    inbox_dir = os.path.join(dump_path, DM_INBOX_PATH)
+    if os.path.isdir(inbox_dir):
+        for root, dirs, files in os.walk(inbox_dir):
+            if 'message_1.json' in files:
+                msg_path = os.path.join(root, 'message_1.json')
+                if file_exists_nonempty(msg_path):
+                    result['d'] = True
+                    break
+    return result
+
+# --- End new logic ---
+
 def read_config():
     config = {}
     if not os.path.exists(CONFIG_FILE):
@@ -109,18 +151,40 @@ def get_profile_dumps():
     entries.sort(key=lambda x: x[2], reverse=True)
     return [(name, path) for name, path, _ in entries]
 
-def print_page(dumps, page):
+# --- New: Pretty print menu with legend and [p l s d] ---
+def print_page(dumps, dump_availability, page):
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_items = dumps[start:end]
-    print(f"Select which profile dump to download from ({len(dumps)} available):")
+    print("Select which profile dump to download from ({} available):".format(len(dumps)))
+    print("Legend: [p] Profile Posts | [l] Liked | [s] Saved | [d] DMs\n")
     for idx, (name, _) in enumerate(page_items, start + 1):
-        print(f"{idx}. {name}")
-    if end < len(dumps):
-        print("n) Next page")
-    if page > 0:
-        print("p) Previous page")
+        avail = dump_availability.get(name, {'p': False, 'l': False, 's': False, 'd': False})
+        flags = ''.join([c if avail[c] else ' ' for c in 'plsd'])
+        print(f"{idx:2d}. {name:<35} [{flags}]")
+    if len(dumps) > PAGE_SIZE:
+        if end < len(dumps):
+            print("n) Next page")
+        if page > 0:
+            print("p) Previous page")
     print("q) Quit")
+
+# --- New: Per-dump options menu ---
+def print_options_menu(avail):
+    options = []
+    if avail['p']:
+        options.append("Profile Posts Download")
+    if avail['l']:
+        options.append("Liked Posts Download")
+    if avail['s']:
+        options.append("Saved Posts Download")
+    if avail['d']:
+        options.append("DM Download")
+    print("\nAvailable download options:")
+    for i, opt in enumerate(options, 1):
+        print(f"{i}. {opt}")
+    print("q) Quit")
+    return options
 
 def main():
     config = read_config()
@@ -131,29 +195,60 @@ def main():
     if not dumps:
         print("No profile dumps found.")
         return
+    # --- New: Scan all dumps for availability ---
+    dump_availability = {}
+    for name, path in dumps:
+        dump_availability[name] = scan_profile_dump(path)
     page = 0
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print_page(dumps, page)
-        choice = input("Enter your choice (number, n, p, q): ").strip().lower()
+        print_page(dumps, dump_availability, page)
+        if len(dumps) > PAGE_SIZE:
+            prompt_msg = "Enter your choice (number, n, p, q): "
+            invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'."
+        else:
+            prompt_msg = "Enter your choice (number, q): "
+            invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, or 'q'."
+        choice = input(prompt_msg).strip().lower()
         if choice.isdigit():
             num = int(choice)
             if 1 <= num <= len(dumps):
                 selected = dumps[num - 1]
-                print(f"You selected: {selected[0]}")
+                selected_name, selected_path = selected
+                avail = dump_availability[selected_name]
+                # --- New: Show options menu for selected dump ---
+                options = print_options_menu(avail)
+                if not options:
+                    print("No download options available for this profile dump.")
+                    input("Press Enter to return to main menu...")
+                    continue
+                while True:
+                    opt_choice = input("Enter your choice (number or q): ").strip().lower()
+                    if opt_choice == 'q':
+                        break
+                    if opt_choice.isdigit():
+                        opt_num = int(opt_choice)
+                        if 1 <= opt_num <= len(options):
+                            print(f"You selected: {options[opt_num-1]}")
+                            # For now, just return the number
+                            return opt_num
+                        else:
+                            print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
+                    else:
+                        print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
                 break
             else:
-                print(f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'.")
+                print(invalid_msg)
                 input("Press Enter to continue...")
-        elif choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
+        elif len(dumps) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
             page += 1
-        elif choice == 'p' and page > 0:
+        elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:
             page -= 1
         elif choice == 'q':
             print("Quitting.")
             break
         else:
-            print(f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'.")
+            print(invalid_msg)
             input("Press Enter to continue...")
 
 if __name__ == "__main__":
