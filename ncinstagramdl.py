@@ -1,5 +1,10 @@
 import os
 import re
+import getpass
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 PAGE_SIZE = 10
@@ -18,6 +23,66 @@ def read_config():
                 key, value = line.split('=', 1)
                 config[key.strip()] = value.strip()
     return config
+
+def verify_login_selenium(username, password):
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.get('https://www.instagram.com/accounts/login/')
+        import time
+        time.sleep(2)  # Wait for page to load
+        # Find and fill username
+        username_field = driver.find_element('name', 'username')
+        username_field.clear()
+        username_field.send_keys(username)
+        # Find and fill password
+        password_field = driver.find_element('name', 'password')
+        password_field.clear()
+        password_field.send_keys(password)
+        # Submit form
+        password_field.submit()
+        time.sleep(4)  # Wait for login to process
+        # Check for login success by looking for the presence of the profile icon or absence of login form
+        if 'login' not in driver.current_url.lower():
+            driver.quit()
+            return True
+        # Alternatively, check for error message
+        page_source = driver.page_source
+        if 'The username you entered doesn\'t belong to an account' in page_source or 'Sorry, your password was incorrect' in page_source:
+            driver.quit()
+            return False
+        # Fallback: if still on login page, treat as failure
+        driver.quit()
+        return False
+    except Exception as e:
+        print(f"[Login Error] {e}")
+        return False
+
+def prompt_for_credentials(config):
+    username = config.get('USERNAME')
+    password = config.get('PASSWORD')
+    # If password is present but username is not, ignore password and prompt for both
+    if not username and password:
+        password = None
+    while True:
+        if not username:
+            username = input('Enter Instagram username: ').strip()
+        if not password:
+            password = getpass.getpass('Enter Instagram password: ')
+        print('Verifying Instagram login...')
+        if verify_login_selenium(username, password):
+            print('Login successful!')
+            return username, password
+        else:
+            print('Login failed. Please try again.')
+            username = input('Enter Instagram username: ').strip()
+            password = getpass.getpass('Enter Instagram password: ')
 
 def get_profile_dumps_dir():
     config = read_config()
@@ -58,6 +123,10 @@ def print_page(dumps, page):
     print("q) Quit")
 
 def main():
+    config = read_config()
+    # Login verification step
+    username, password = prompt_for_credentials(config)
+    # Proceed to main script
     dumps = get_profile_dumps()
     if not dumps:
         print("No profile dumps found.")
