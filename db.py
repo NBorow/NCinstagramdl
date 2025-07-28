@@ -72,7 +72,26 @@ def is_downloaded(conn: sqlite3.Connection, shortcode: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def record_download(conn: sqlite3.Connection, post: Dict) -> bool:
+def get_post(conn: sqlite3.Connection, shortcode: str) -> Optional[Dict]:
+    """
+    Get a post record from the database by shortcode.
+    
+    Args:
+        conn: Database connection
+        shortcode: Instagram post shortcode
+        
+    Returns:
+        Optional[Dict]: Post record as dictionary or None if not found
+    """
+    cursor = conn.execute('SELECT * FROM posts WHERE shortcode = ?', (shortcode,))
+    row = cursor.fetchone()
+    if row:
+        colnames = [desc[0] for desc in cursor.description]
+        return dict(zip(colnames, row))
+    return None
+
+
+def record_download(conn: sqlite3.Connection, post: Dict) -> str:
     """
     Record a successful download in the database.
     
@@ -83,7 +102,7 @@ def record_download(conn: sqlite3.Connection, post: Dict) -> bool:
               source, username, timestamp_ms, status (optional)
               
     Returns:
-        bool: True if record was inserted, False if duplicate
+        str: "inserted", "duplicate", or "error"
     """
     try:
         # Use INSERT OR IGNORE to handle duplicates gracefully
@@ -108,14 +127,17 @@ def record_download(conn: sqlite3.Connection, post: Dict) -> bool:
         conn.commit()
         
         # Check if the insert actually happened (not ignored due to duplicate)
-        return conn.total_changes > 0
+        if conn.total_changes > 0:
+            return "inserted"
+        else:
+            return "duplicate"
         
     except sqlite3.Error as e:
         print(f"Database error recording download: {e}")
-        return False
+        return "error"
 
 
-def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> bool:
+def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
     """
     Record a failed download attempt in the database.
     
@@ -125,7 +147,7 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> bool:
         error: Error message describing the failure
         
     Returns:
-        bool: True if record was inserted, False if duplicate
+        str: "inserted", "duplicate", or "error"
     """
     try:
         # Use INSERT OR IGNORE to handle duplicates gracefully
@@ -151,11 +173,14 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> bool:
         conn.commit()
         
         # Check if the insert actually happened (not ignored due to duplicate)
-        return conn.total_changes > 0
+        if conn.total_changes > 0:
+            return "inserted"
+        else:
+            return "duplicate"
         
     except sqlite3.Error as e:
         print(f"Database error recording failure: {e}")
-        return False
+        return "error"
 
 
 def get_download_stats(conn: sqlite3.Connection) -> Dict[str, int]:
