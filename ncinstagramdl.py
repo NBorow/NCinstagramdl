@@ -5,10 +5,14 @@ import json
 import time
 import subprocess
 import unicodedata
+import random
 from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
 
@@ -365,9 +369,181 @@ def download_post(conn, post_data, download_dir):
         print(f"[ERROR] {shortcode} → database error recording failure")
     return False
 
+
+
+def extract_urls_from_current_page(driver, username):
+    """Extract URLs and captions from the current page state"""
+    urls = set()
+    post_data = {}
+    
+    # Try multiple selectors for post links
+    selectors = [
+        "a[href*='/p/']",
+        "a[href*='/reel/']",
+        "article a[href*='/p/']",
+        "article a[href*='/reel/']",
+        "div[role='button'] a[href*='/p/']",
+        "div[role='button'] a[href*='/reel/']"
+    ]
+    
+    for selector in selectors:
+        try:
+            post_links = driver.find_elements(By.CSS_SELECTOR, selector)
+            
+            for link in post_links:
+                href = link.get_attribute('href')
+                if href and ('/p/' in href or '/reel/' in href):
+                    urls.add(href)
+                    
+                    # Try to get caption from the post
+                    try:
+                        # Look for caption in nearby elements
+                        caption_element = link.find_element(By.XPATH, ".//ancestor::article//div[contains(@class, 'caption') or contains(@class, 'text')]")
+                        caption = caption_element.text.strip()
+                        if caption:
+                            post_data[href] = caption
+                    except:
+                        # No caption found, that's okay
+                        pass
+        except Exception as e:
+            # Silently continue if selector fails
+            pass
+    
+    return urls, post_data
+
+def get_profile_post_urls(username):
+    """Get all post URLs from a profile using Selenium"""
+    print(f"[PROFILE] Getting post URLs for @{username} using Selenium")
+    
+    try:
+        # Dictionary to store URLs and their captions
+        post_data = {}
+        
+        # Set up Chrome options
+        options = Options()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_argument("--start-maximized")
+        options.add_argument(f"user-data-dir={os.path.abspath('chrome-profile')}")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        
+        # Create driver
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        
+        try:
+            # Navigate to profile
+            profile_url = f"https://www.instagram.com/{username}/"
+            print(f"[PROFILE] Loading profile page: {profile_url}")
+            
+            driver.get(profile_url)
+            
+            # Wait for page to load
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Wait for posts to load - look for the post grid
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "article"))
+                )
+                print(f"[PROFILE] Found post grid for @{username}")
+            except:
+                print(f"[PROFILE] Post grid not found, trying to scroll for @{username}")
+            
+            # Scroll down to load more posts
+            time.sleep(3)
+            
+            # Scroll down to load all posts and collect URLs during scrolling
+            previous_height = driver.execute_script("return document.body.scrollHeight")
+            scroll_attempts = 0
+            max_scrolls = 20  # Limit to prevent infinite scrolling
+            all_urls = set()  # Use set to avoid duplicates
+            all_post_data = {}
+            
+            while scroll_attempts < max_scrolls:
+                # Collect URLs before scrolling
+                current_urls, current_post_data = extract_urls_from_current_page(driver, username)
+                all_urls.update(current_urls)
+                all_post_data.update(current_post_data)
+                
+                print(f"[PROFILE] After scroll {scroll_attempts}: Found {len(all_urls)} total URLs for @{username}")
+                
+                # Scroll down
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                
+                # Check if new content loaded
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == previous_height:
+                    # No new content loaded, we've reached the bottom
+                    print(f"[PROFILE] Reached bottom after {scroll_attempts} scrolls for @{username}")
+                    break
+                
+                previous_height = new_height
+                scroll_attempts += 1
+                print(f"[PROFILE] Scrolled {scroll_attempts}/{max_scrolls} for @{username}")
+            
+            # Final collection after scrolling is done
+            final_urls, final_post_data = extract_urls_from_current_page(driver, username)
+            all_urls.update(final_urls)
+            all_post_data.update(final_post_data)
+            
+            # Wait a bit more for posts to load
+            time.sleep(3)
+            
+            # Get page source
+            content = driver.page_source
+            
+            # Convert sets back to lists for return
+            urls = list(all_urls)
+            print(f"[PROFILE] Total unique URLs found: {len(urls)} for @{username}")
+            
+            if urls:
+                print(f"[PROFILE] Found {len(urls)} posts via Selenium for @{username}")
+                return urls, all_post_data
+            
+            # Fallback: try to find shortcodes in the page source
+            print(f"[PROFILE] Trying fallback method for @{username}")
+            
+            # Look for shortcodes in the HTML
+            shortcode_pattern = r'"shortcode":"([A-Za-z0-9_-]{11})"'
+            shortcodes = re.findall(shortcode_pattern, content)
+            
+            if shortcodes:
+                urls = []
+                for shortcode in shortcodes:
+                    urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                
+                print(f"[PROFILE] Found {len(urls)} posts via HTML parsing for @{username}")
+                return urls, post_data
+            
+            # Another fallback: look for post URLs directly
+            post_url_pattern = r'https://www\.instagram\.com/p/([A-Za-z0-9_-]{11})/'
+            post_urls = re.findall(post_url_pattern, content)
+            
+            if post_urls:
+                urls = []
+                for shortcode in post_urls:
+                    urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                
+                print(f"[PROFILE] Found {len(urls)} posts via URL pattern for @{username}")
+                return urls, post_data
+            
+            print(f"[FAILED] No posts found for @{username}")
+            return [], {}
+            
+        finally:
+            driver.quit()
+        
+    except Exception as e:
+        print(f"[ERROR] Error using Selenium for @{username}: {e}")
+        return [], {}
+
 def download_profile_posts(conn, username, download_dir, source='dm_profile'):
     """
-    Download all posts from a user's profile.
+    Download all posts from a user's profile using Selenium scraping.
     
     Args:
         conn: Database connection
@@ -378,34 +554,80 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile'):
     Returns:
         bool: True if any posts were downloaded successfully
     """
-    print(f"Downloading profile posts for @{username}...")
+    print(f"[PROFILE] Downloading all posts from @{username}")
     
-    # This is a placeholder - in a full implementation, you would:
-    # 1. Scrape the user's profile page to get post URLs
-    # 2. Extract shortcodes from those URLs
-    # 3. Download each post using download_post()
-    
-    # For now, we'll just record that we attempted this
-    profile_data = {
-        'shortcode': f'profile_{username}',
-        'url': f'https://www.instagram.com/{username}/',
-        'original_owner': username,
-        'share_text': '',
-        'caption': f'Profile download for @{username}',
-        'timestamp_ms': int(time.time() * 1000),
-        'source': source
-    }
-    
-    # Record the profile download attempt
-    status = record_download(conn, profile_data)
-    if status == "inserted":
-        print(f"[RECORDED] Profile download for @{username}")
-    elif status == "duplicate":
-        print(f"[DUPLICATE] Profile download for @{username} already recorded")
-    else:
-        print(f"[ERROR] Profile download for @{username} → database error")
-    
-    return True
+    try:
+        # Create profile-specific folder
+        profile_dir = os.path.join(download_dir, "profiles", sanitize_filename(username))
+        os.makedirs(profile_dir, exist_ok=True)
+        
+        # First, get all post URLs from the profile using Selenium
+        result = get_profile_post_urls(username)
+        
+        if not result or len(result) != 2:
+            print(f"[FAILED] No post URLs found for @{username}")
+            return False
+        
+        post_urls, post_data = result
+        
+        if not post_urls:
+            print(f"[FAILED] No post URLs found for @{username}")
+            return False
+        
+        print(f"[PROFILE] Found {len(post_urls)} posts to download for @{username}")
+        
+        # Download each post individually using our existing download_post method
+        successful_downloads = 0
+        skipped_count = 0
+        
+        for i, post_url in enumerate(post_urls, 1):
+            print(f"[PROFILE] Downloading post {i}/{len(post_urls)}: {post_url}")
+            
+            # Extract shortcode from URL
+            shortcode = extract_shortcode_from_url(post_url)
+            if not shortcode:
+                print(f"[FAILED] Could not extract shortcode from {post_url}")
+                continue
+            
+            # Check if already downloaded
+            if is_downloaded(conn, shortcode):
+                print(f"[SKIP] {shortcode} already downloaded for @{username}")
+                skipped_count += 1
+                continue
+            
+            # Get caption for this post if available
+            post_caption = post_data.get(post_url, "")
+            
+            # Create post data structure
+            post_data_dict = {
+                'shortcode': shortcode,
+                'url': post_url,
+                'original_owner': username,
+                'share_text': '',
+                'caption': post_caption,
+                'timestamp_ms': int(time.time() * 1000),
+                'source': source
+            }
+            
+            # Use our existing download method
+            if download_post(conn, post_data_dict, profile_dir):
+                successful_downloads += 1
+                print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
+            else:
+                print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
+            
+
+        
+        if successful_downloads > 0:
+            print(f"[SUCCESS] Downloaded {successful_downloads}/{len(post_urls)} posts from @{username} (skipped {skipped_count})")
+            return True
+        else:
+            print(f"[FAILED] No posts downloaded from @{username}")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Profile @{username} - {e}")
+        return False
 
 def process_dm_download(conn, selected_path):
     """
