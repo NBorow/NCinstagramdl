@@ -3,11 +3,21 @@ import re
 import getpass
 import json
 import time
+import subprocess
+import unicodedata
+import random
+from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
+
+# Import database functions
+from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
@@ -102,6 +112,587 @@ def are_cookies_valid(cookie_file=COOKIE_FILE):
         return False
 
 # --- End cookie logic ---
+
+def sanitize_filename(filename):
+    """
+    Sanitize filename by removing/replacing invalid characters.
+    
+    Args:
+        filename: Raw filename string
+        
+    Returns:
+        str: Sanitized filename safe for filesystem
+    """
+    # Remove or replace invalid characters
+    filename = unicodedata.normalize('NFKD', filename)
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    filename = re.sub(r'\s+', ' ', filename)  # Replace multiple spaces with single
+    filename = filename.strip()
+    return filename
+
+def generate_filename(post_data, max_length=200):
+    """
+    Generate structured filename for downloaded posts.
+    
+    Args:
+        post_data: Dictionary containing post information
+        max_length: Maximum filename length (default 200)
+        
+    Returns:
+        str: Generated filename template
+    """
+    parts = []
+    
+    # Always include shortcode
+    shortcode = post_data.get('shortcode', '')
+    if shortcode:
+        parts.append(shortcode)
+    
+    # Add original owner if present
+    original_owner = post_data.get('original_owner', '')
+    if original_owner:
+        parts.append(f"by_{original_owner}")
+    
+    # Add share text if present
+    share_text = post_data.get('share_text', '')
+    if share_text:
+        parts.append(sanitize_filename(share_text))
+    
+    # Add caption if present and there's room
+    caption = post_data.get('caption', '')
+    if caption:
+        # Calculate remaining space for caption
+        current_length = sum(len(part) + 1 for part in parts)  # +1 for underscores
+        remaining_space = max_length - current_length - 10  # Leave room for extension
+        
+        if remaining_space > 10:  # Only add if we have meaningful space
+            sanitized_caption = sanitize_filename(caption)
+            if len(sanitized_caption) > remaining_space:
+                sanitized_caption = sanitized_caption[:remaining_space-3] + "..."
+            parts.append(sanitized_caption)
+    
+    # Join parts with underscores
+    filename = "_".join(parts)
+    
+    # Ensure we don't exceed max length
+    if len(filename) > max_length:
+        filename = filename[:max_length-3] + "..."
+    
+    # Add extension placeholder
+    filename += ".%(ext)s"
+    
+    return filename
+
+def extract_shortcode_from_url(url):
+    """
+    Extract Instagram shortcode from URL.
+    
+    Args:
+        url: Instagram post URL
+        
+    Returns:
+        str: Shortcode or None if not found
+    """
+    # Handle various Instagram URL formats
+    patterns = [
+        r'instagram\.com/p/([A-Za-z0-9_-]+)',
+        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
+        r'instagram\.com/tv/([A-Za-z0-9_-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def extract_dm_posts_and_profiles(dm_json_path):
+    """
+    Extract posts and profiles from DM JSON file.
+    
+    Args:
+        dm_json_path: Path to message_1.json file
+        
+    Returns:
+        tuple: (posts_list, profiles_list)
+    """
+    posts = []
+    profiles = []
+    
+    try:
+        with open(dm_json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Navigate to messages array
+        messages = data.get('messages', [])
+        
+        for message in messages:
+            # Check if message has a share
+            if 'share' in message:
+                share = message['share']
+                link = share.get('link', '')
+                
+                if not link:
+                    continue
+                
+                # Check if it's a profile share
+                if '/_u/' in link:
+                    # Profile share
+                    username_match = re.search(r'/_u/([^/]+)', link)
+                    if username_match:
+                        profile_data = {
+                            'username': username_match.group(1),
+                            'profile_name': share.get('share_text', ''),
+                            'timestamp': message.get('timestamp_ms', 0)
+                        }
+                        profiles.append(profile_data)
+                else:
+                    # Post share
+                    shortcode = extract_shortcode_from_url(link)
+                    if shortcode:
+                        post_data = {
+                            'shortcode': shortcode,
+                            'url': link,
+                            'original_owner': share.get('original_owner', ''),
+                            'share_text': share.get('share_text', ''),
+                            'caption': None,  # Currently not available in DM shares
+                            'timestamp_ms': message.get('timestamp_ms', 0),
+                            'source': 'dm'
+                        }
+                        posts.append(post_data)
+    
+    except Exception as e:
+        print(f"Error parsing DM JSON {dm_json_path}: {e}")
+    
+    return posts, profiles
+
+def download_post(conn, post_data, download_dir):
+    """
+    Download a single Instagram post using yt-dlp with fallback to gallery-dl.
+    
+    Args:
+        conn: Database connection
+        post_data: Dictionary containing post information
+        download_dir: Directory to save the download
+        
+    Returns:
+        bool: True if download successful, False otherwise
+    """
+    shortcode = post_data.get('shortcode')
+    url = post_data.get('url')
+    
+    if not shortcode or not url:
+        print(f"Missing shortcode or URL for post")
+        return False
+    
+    # Check if already downloaded
+    if is_downloaded(conn, shortcode):
+        print(f"[SKIPPED] {shortcode} already recorded")
+        return True
+    
+    # Generate filename
+    filename_template = generate_filename(post_data)
+    output_path = os.path.join(download_dir, filename_template)
+    
+    print(f"Downloading {shortcode}...")
+    
+    # Try yt-dlp first
+    try:
+        cmd = [
+            'yt-dlp',
+            '--cookies', COOKIE_FILE,
+            '--output', output_path,
+            '--no-check-certificate',
+            '--ignore-errors',
+            url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            print(f"Successfully downloaded {shortcode}")
+            status = record_download(conn, post_data)
+            if status == "inserted":
+                print(f"[RECORDED] {shortcode} successfully")
+            elif status == "duplicate":
+                print(f"[DUPLICATE] {shortcode} already in database")
+            else:
+                print(f"[ERROR] {shortcode} → database error")
+            return True
+        else:
+            print(f"yt-dlp failed for {shortcode}: {result.stderr}")
+            
+    except subprocess.TimeoutExpired:
+        print(f"yt-dlp timeout for {shortcode}")
+    except Exception as e:
+        print(f"yt-dlp error for {shortcode}: {e}")
+    
+    # Fallback to gallery-dl
+    try:
+        cmd = [
+            'gallery-dl',
+            '--cookies', COOKIE_FILE,
+            '--dest', download_dir,
+            '--filename', filename_template,
+            url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            print(f"Successfully downloaded {shortcode} with gallery-dl")
+            status = record_download(conn, post_data)
+            if status == "inserted":
+                print(f"[RECORDED] {shortcode} successfully")
+            elif status == "duplicate":
+                print(f"[DUPLICATE] {shortcode} already in database")
+            else:
+                print(f"[ERROR] {shortcode} → database error")
+            return True
+        else:
+            print(f"gallery-dl failed for {shortcode}: {result.stderr}")
+            
+    except subprocess.TimeoutExpired:
+        print(f"gallery-dl timeout for {shortcode}")
+    except Exception as e:
+        print(f"gallery-dl error for {shortcode}: {e}")
+    
+    # Record failure
+    error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
+    status = record_failure(conn, post_data, error_msg)
+    if status == "inserted":
+        print(f"[ERROR] {shortcode} → {error_msg}")
+    elif status == "duplicate":
+        print(f"[DUPLICATE] {shortcode} failure already recorded")
+    else:
+        print(f"[ERROR] {shortcode} → database error recording failure")
+    return False
+
+
+
+def extract_urls_from_current_page(driver, username):
+    """Extract URLs and captions from the current page state"""
+    urls = set()
+    post_data = {}
+    
+    # Try multiple selectors for post links
+    selectors = [
+        "a[href*='/p/']",
+        "a[href*='/reel/']",
+        "article a[href*='/p/']",
+        "article a[href*='/reel/']",
+        "div[role='button'] a[href*='/p/']",
+        "div[role='button'] a[href*='/reel/']"
+    ]
+    
+    for selector in selectors:
+        try:
+            post_links = driver.find_elements(By.CSS_SELECTOR, selector)
+            
+            for link in post_links:
+                href = link.get_attribute('href')
+                if href and ('/p/' in href or '/reel/' in href):
+                    urls.add(href)
+                    
+                    # Try to get caption from the post
+                    try:
+                        # Look for caption in nearby elements
+                        caption_element = link.find_element(By.XPATH, ".//ancestor::article//div[contains(@class, 'caption') or contains(@class, 'text')]")
+                        caption = caption_element.text.strip()
+                        if caption:
+                            post_data[href] = caption
+                    except:
+                        # No caption found, that's okay
+                        pass
+        except Exception as e:
+            # Silently continue if selector fails
+            pass
+    
+    return urls, post_data
+
+def get_profile_post_urls(username):
+    """Get all post URLs from a profile using Selenium"""
+    print(f"[PROFILE] Getting post URLs for @{username} using Selenium")
+    
+    try:
+        # Dictionary to store URLs and their captions
+        post_data = {}
+        
+        # Set up Chrome options
+        options = Options()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_argument("--start-maximized")
+        options.add_argument(f"user-data-dir={os.path.abspath('chrome-profile')}")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        
+        # Create driver
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        
+        try:
+            # Navigate to profile
+            profile_url = f"https://www.instagram.com/{username}/"
+            print(f"[PROFILE] Loading profile page: {profile_url}")
+            
+            driver.get(profile_url)
+            
+            # Wait for page to load
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Wait for posts to load - look for the post grid
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "article"))
+                )
+                print(f"[PROFILE] Found post grid for @{username}")
+            except:
+                print(f"[PROFILE] Post grid not found, trying to scroll for @{username}")
+            
+            # Scroll down to load more posts
+            time.sleep(3)
+            
+            # Scroll down to load all posts and collect URLs during scrolling
+            previous_height = driver.execute_script("return document.body.scrollHeight")
+            scroll_attempts = 0
+            max_scrolls = 20  # Limit to prevent infinite scrolling
+            all_urls = set()  # Use set to avoid duplicates
+            all_post_data = {}
+            
+            while scroll_attempts < max_scrolls:
+                # Collect URLs before scrolling
+                current_urls, current_post_data = extract_urls_from_current_page(driver, username)
+                all_urls.update(current_urls)
+                all_post_data.update(current_post_data)
+                
+                print(f"[PROFILE] After scroll {scroll_attempts}: Found {len(all_urls)} total URLs for @{username}")
+                
+                # Scroll down
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                
+                # Check if new content loaded
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == previous_height:
+                    # No new content loaded, we've reached the bottom
+                    print(f"[PROFILE] Reached bottom after {scroll_attempts} scrolls for @{username}")
+                    break
+                
+                previous_height = new_height
+                scroll_attempts += 1
+                print(f"[PROFILE] Scrolled {scroll_attempts}/{max_scrolls} for @{username}")
+            
+            # Final collection after scrolling is done
+            final_urls, final_post_data = extract_urls_from_current_page(driver, username)
+            all_urls.update(final_urls)
+            all_post_data.update(final_post_data)
+            
+            # Wait a bit more for posts to load
+            time.sleep(3)
+            
+            # Get page source
+            content = driver.page_source
+            
+            # Convert sets back to lists for return
+            urls = list(all_urls)
+            print(f"[PROFILE] Total unique URLs found: {len(urls)} for @{username}")
+            
+            if urls:
+                print(f"[PROFILE] Found {len(urls)} posts via Selenium for @{username}")
+                return urls, all_post_data
+            
+            # Fallback: try to find shortcodes in the page source
+            print(f"[PROFILE] Trying fallback method for @{username}")
+            
+            # Look for shortcodes in the HTML
+            shortcode_pattern = r'"shortcode":"([A-Za-z0-9_-]{11})"'
+            shortcodes = re.findall(shortcode_pattern, content)
+            
+            if shortcodes:
+                urls = []
+                for shortcode in shortcodes:
+                    urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                
+                print(f"[PROFILE] Found {len(urls)} posts via HTML parsing for @{username}")
+                return urls, post_data
+            
+            # Another fallback: look for post URLs directly
+            post_url_pattern = r'https://www\.instagram\.com/p/([A-Za-z0-9_-]{11})/'
+            post_urls = re.findall(post_url_pattern, content)
+            
+            if post_urls:
+                urls = []
+                for shortcode in post_urls:
+                    urls.append(f"https://www.instagram.com/p/{shortcode}/")
+                
+                print(f"[PROFILE] Found {len(urls)} posts via URL pattern for @{username}")
+                return urls, post_data
+            
+            print(f"[FAILED] No posts found for @{username}")
+            return [], {}
+            
+        finally:
+            driver.quit()
+        
+    except Exception as e:
+        print(f"[ERROR] Error using Selenium for @{username}: {e}")
+        return [], {}
+
+def download_profile_posts(conn, username, download_dir, source='dm_profile'):
+    """
+    Download all posts from a user's profile using Selenium scraping.
+    
+    Args:
+        conn: Database connection
+        username: Instagram username
+        download_dir: Directory to save downloads
+        source: Source identifier for database
+        
+    Returns:
+        bool: True if any posts were downloaded successfully
+    """
+    print(f"[PROFILE] Downloading all posts from @{username}")
+    
+    try:
+        # Create profile-specific folder
+        profile_dir = os.path.join(download_dir, "profiles", sanitize_filename(username))
+        os.makedirs(profile_dir, exist_ok=True)
+        
+        # First, get all post URLs from the profile using Selenium
+        result = get_profile_post_urls(username)
+        
+        if not result or len(result) != 2:
+            print(f"[FAILED] No post URLs found for @{username}")
+            return False
+        
+        post_urls, post_data = result
+        
+        if not post_urls:
+            print(f"[FAILED] No post URLs found for @{username}")
+            return False
+        
+        print(f"[PROFILE] Found {len(post_urls)} posts to download for @{username}")
+        
+        # Download each post individually using our existing download_post method
+        successful_downloads = 0
+        skipped_count = 0
+        
+        for i, post_url in enumerate(post_urls, 1):
+            print(f"[PROFILE] Downloading post {i}/{len(post_urls)}: {post_url}")
+            
+            # Extract shortcode from URL
+            shortcode = extract_shortcode_from_url(post_url)
+            if not shortcode:
+                print(f"[FAILED] Could not extract shortcode from {post_url}")
+                continue
+            
+            # Check if already downloaded
+            if is_downloaded(conn, shortcode):
+                print(f"[SKIP] {shortcode} already downloaded for @{username}")
+                skipped_count += 1
+                continue
+            
+            # Get caption for this post if available
+            post_caption = post_data.get(post_url, "")
+            
+            # Create post data structure
+            post_data_dict = {
+                'shortcode': shortcode,
+                'url': post_url,
+                'original_owner': username,
+                'share_text': '',
+                'caption': post_caption,
+                'timestamp_ms': int(time.time() * 1000),
+                'source': source
+            }
+            
+            # Use our existing download method
+            if download_post(conn, post_data_dict, profile_dir):
+                successful_downloads += 1
+                print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
+            else:
+                print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
+            
+
+        
+        if successful_downloads > 0:
+            print(f"[SUCCESS] Downloaded {successful_downloads}/{len(post_urls)} posts from @{username} (skipped {skipped_count})")
+            return True
+        else:
+            print(f"[FAILED] No posts downloaded from @{username}")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Profile @{username} - {e}")
+        return False
+
+def process_dm_download(conn, selected_path):
+    """
+    Process DM downloads from a selected profile dump.
+    
+    Args:
+        conn: Database connection
+        selected_path: Path to the selected profile dump
+        
+    Returns:
+        bool: True if processing completed successfully
+    """
+    print("Processing DM downloads...")
+    
+    # Find message_1.json files in the inbox
+    inbox_dir = os.path.join(selected_path, DM_INBOX_PATH)
+    if not os.path.exists(inbox_dir):
+        print(f"DM inbox directory not found: {inbox_dir}")
+        return False
+    
+    message_files = []
+    for root, dirs, files in os.walk(inbox_dir):
+        if 'message_1.json' in files:
+            message_files.append(os.path.join(root, 'message_1.json'))
+    
+    if not message_files:
+        print("No message files found in DM inbox")
+        return False
+    
+    print(f"Found {len(message_files)} message files to process")
+    
+    # Create download directory
+    dm_download_dir = os.path.join(selected_path, "downloads", "dms")
+    os.makedirs(dm_download_dir, exist_ok=True)
+    
+    total_posts = 0
+    total_profiles = 0
+    
+    for msg_file in message_files:
+        print(f"\nProcessing {os.path.basename(os.path.dirname(msg_file))}...")
+        
+        # Extract posts and profiles
+        posts, profiles = extract_dm_posts_and_profiles(msg_file)
+        
+        print(f"Found {len(posts)} shared posts and {len(profiles)} shared profiles")
+        
+        # Handle profile downloads
+        if profiles:
+            response = input(f"This DM includes {len(profiles)} shared profiles. Download all their posts? (y/n): ").strip().lower()
+            if response == 'y':
+                for profile in profiles:
+                    username = profile['username']
+                    download_profile_posts(conn, username, dm_download_dir, 'dm_profile')
+                    total_profiles += 1
+        
+        # Download shared posts
+        for post in posts:
+            if download_post(conn, post, dm_download_dir):
+                total_posts += 1
+    
+    print(f"\nDM download complete!")
+    print(f"Total posts downloaded: {total_posts}")
+    print(f"Total profiles processed: {total_profiles}")
+    
+    return True
 
 def read_config():
     config = {}
@@ -238,75 +829,110 @@ def print_options_menu(avail):
 
 def main():
     config = read_config()
-    # --- Cookie check: only login if cookies are missing/invalid ---
-    first_check = True
-    while not are_cookies_valid():
+    
+    # Initialize SQLite database
+    db_path = os.path.join(os.path.dirname(__file__), 'downloaded_posts.db')
+    conn = init_db(db_path)
+    
+    try:
+        # --- Cookie check: only login if cookies are missing/invalid ---
+        first_check = True
+        while not are_cookies_valid():
+            if first_check:
+                print("No valid cookies found. Login required.")
+                first_check = False
+            username, password = prompt_for_credentials(config)
+            # After this, cookies will be saved if login is successful
+            # Double-check cookies after login, loop if still invalid
+            if not are_cookies_valid():
+                print("[ERROR] Login failed or cookies could not be saved/validated. Please try again or Ctrl+C to quit.")
         if first_check:
-            print("No valid cookies found. Login required.")
-            first_check = False
-        username, password = prompt_for_credentials(config)
-        # After this, cookies will be saved if login is successful
-        # Double-check cookies after login, loop if still invalid
-        if not are_cookies_valid():
-            print("[ERROR] Login failed or cookies could not be saved/validated. Please try again or Ctrl+C to quit.")
-    if first_check:
-        print("Valid Instagram cookies found. Skipping login.")
-    # Proceed to main script
-    dumps = get_profile_dumps()
-    if not dumps:
-        print("No profile dumps found.")
-        return
-    dump_availability = {}
-    for name, path in dumps:
-        dump_availability[name] = scan_profile_dump(path)
-    page = 0
-    while True:
-        print_page(dumps, dump_availability, page)
-        if len(dumps) > PAGE_SIZE:
-            prompt_msg = "Enter your choice (number, n, p, q): "
-            invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'."
-        else:
-            prompt_msg = "Enter your choice (number, q): "
-            invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, or 'q'."
-        choice = input(prompt_msg).strip().lower()
-        if choice.isdigit():
-            num = int(choice)
-            if 1 <= num <= len(dumps):
-                selected = dumps[num - 1]
-                selected_name, selected_path = selected
-                avail = dump_availability[selected_name]
-                options = print_options_menu(avail)
-                if not options:
-                    print("No download options available for this profile dump.")
-                    input("Press Enter to return to main menu...")
-                    continue
-                while True:
-                    opt_choice = input("Enter your choice (number or q): ").strip().lower()
-                    if opt_choice == 'q':
-                        break
-                    if opt_choice.isdigit():
-                        opt_num = int(opt_choice)
-                        if 1 <= opt_num <= len(options):
-                            print(f"You selected: {options[opt_num-1]}")
-                            return opt_num
+            print("Valid Instagram cookies found. Skipping login.")
+        
+        # Proceed to main script
+        dumps = get_profile_dumps()
+        if not dumps:
+            print("No profile dumps found.")
+            return
+        
+        dump_availability = {}
+        for name, path in dumps:
+            dump_availability[name] = scan_profile_dump(path)
+        
+        page = 0
+        while True:
+            print_page(dumps, dump_availability, page)
+            if len(dumps) > PAGE_SIZE:
+                prompt_msg = "Enter your choice (number, n, p, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'."
+            else:
+                prompt_msg = "Enter your choice (number, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, or 'q'."
+            
+            choice = input(prompt_msg).strip().lower()
+            if choice.isdigit():
+                num = int(choice)
+                if 1 <= num <= len(dumps):
+                    selected = dumps[num - 1]
+                    selected_name, selected_path = selected
+                    avail = dump_availability[selected_name]
+                    options = print_options_menu(avail)
+                    
+                    if not options:
+                        print("No download options available for this profile dump.")
+                        input("Press Enter to return to main menu...")
+                        continue
+                    
+                    while True:
+                        opt_choice = input("Enter your choice (number or q): ").strip().lower()
+                        if opt_choice == 'q':
+                            break
+                        if opt_choice.isdigit():
+                            opt_num = int(opt_choice)
+                            if 1 <= opt_num <= len(options):
+                                selected_option = options[opt_num-1]
+                                print(f"You selected: {selected_option}")
+                                
+                                # Handle different download options
+                                if "DM Download" in selected_option:
+                                    process_dm_download(conn, selected_path)
+                                elif "Profile Posts Download" in selected_option:
+                                    print("Profile posts download not yet implemented")
+                                elif "Liked Posts Download" in selected_option:
+                                    print("Liked posts download not yet implemented")
+                                elif "Saved Posts Download" in selected_option:
+                                    print("Saved posts download not yet implemented")
+                                
+                                # Print download statistics
+                                print("\nDownload Statistics:")
+                                stats = get_download_stats(conn)
+                                for key, value in stats.items():
+                                    print(f"  {key}: {value}")
+                                
+                                input("Press Enter to return to main menu...")
+                                break
+                            else:
+                                print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
                         else:
                             print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
-                    else:
-                        print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
+                    break
+                else:
+                    print(invalid_msg)
+                    input("Press Enter to continue...")
+            elif len(dumps) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
+                page += 1
+            elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:
+                page -= 1
+            elif choice == 'q':
+                print("Quitting.")
                 break
             else:
                 print(invalid_msg)
                 input("Press Enter to continue...")
-        elif len(dumps) > PAGE_SIZE and choice == 'n' and (page + 1) * PAGE_SIZE < len(dumps):
-            page += 1
-        elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:
-            page -= 1
-        elif choice == 'q':
-            print("Quitting.")
-            break
-        else:
-            print(invalid_msg)
-            input("Press Enter to continue...")
+    
+    finally:
+        # Clean exit - close database connection
+        close_db(conn)
 
 if __name__ == "__main__":
     main() 
