@@ -1,0 +1,47 @@
+# Database files
+*.db
+downloaded_posts.db
+
+# Cookie files (contain sensitive login data)
+insta_cookies.txt
+*.cookies
+
+# Configuration files (may contain personal paths/credentials)
+config.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Downloaded content (if any gets created in the project directory)
+downloads/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+downloaded_posts.db
