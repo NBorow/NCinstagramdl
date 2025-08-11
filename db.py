@@ -56,17 +56,17 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
 def is_downloaded(conn: sqlite3.Connection, shortcode: str) -> bool:
     """
-    Check if a post with the given shortcode has already been downloaded.
+    Check if a post with the given shortcode has already been successfully downloaded.
     
     Args:
         conn: Database connection
         shortcode: Instagram post shortcode
         
     Returns:
-        bool: True if post is already recorded, False otherwise
+        bool: True if post was successfully downloaded, False otherwise
     """
     cursor = conn.execute(
-        'SELECT 1 FROM posts WHERE shortcode = ? LIMIT 1',
+        'SELECT 1 FROM posts WHERE shortcode = ? AND status = "success" LIMIT 1',
         (shortcode,)
     )
     return cursor.fetchone() is not None
@@ -224,4 +224,39 @@ def close_db(conn: sqlite3.Connection):
         conn: Database connection to close
     """
     if conn:
-        conn.close() 
+        conn.close()
+
+
+def get_recent_download_timestamps(conn: sqlite3.Connection, since_epoch_seconds: float) -> list:
+    """
+    Return a list of UNIX timestamps (seconds) for successful downloads
+    with created_at >= since_epoch_seconds. If not available, return [].
+    
+    Args:
+        conn: Database connection
+        since_epoch_seconds: Minimum timestamp to include (UNIX seconds)
+        
+    Returns:
+        list: List of UNIX timestamps (seconds) for successful downloads
+    """
+    try:
+        # Convert to datetime for SQLite comparison
+        since_datetime = datetime.fromtimestamp(since_epoch_seconds).isoformat()
+        
+        cursor = conn.execute('''
+            SELECT downloaded_at FROM posts 
+            WHERE status = 'success' AND downloaded_at >= ?
+            ORDER BY downloaded_at
+        ''', (since_datetime,))
+        
+        timestamps = []
+        for row in cursor.fetchall():
+            # Convert SQLite datetime to UNIX timestamp
+            dt = datetime.fromisoformat(row[0])
+            timestamps.append(dt.timestamp())
+        
+        return timestamps
+        
+    except Exception as e:
+        print(f"Error fetching recent download timestamps: {e}")
+        return [] 

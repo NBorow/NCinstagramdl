@@ -6,6 +6,9 @@ import time
 import subprocess
 import unicodedata
 import random
+import shutil
+from collections import deque
+from datetime import datetime
 from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -17,7 +20,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 import requests
 
 # Import database functions
-from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db
+from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
@@ -29,6 +32,121 @@ LIKED_PATH = os.path.join('your_instagram_activity', 'likes', 'liked_posts.json'
 SAVED_COLLECTIONS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_collections.json')
 SAVED_POSTS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_posts.json')
 DM_INBOX_PATH = os.path.join('your_instagram_activity', 'messages', 'inbox')
+
+# --- Safety Settings ---
+SAFETY_KEYS = [
+    'MIN_DELAY_SECONDS',
+    'MAX_DELAY_SECONDS', 
+    'LONG_BREAK_EVERY',
+    'LONG_BREAK_MIN_SECONDS',
+    'LONG_BREAK_MAX_SECONDS',
+    'HOURLY_POST_CAP',
+    'DAILY_POST_CAP'
+]
+
+SAFETY_PRESETS = {
+    'super_safe': {
+        'MIN_DELAY_SECONDS': '20',
+        'MAX_DELAY_SECONDS': '40',
+        'LONG_BREAK_EVERY': '15',
+        'LONG_BREAK_MIN_SECONDS': '180',
+        'LONG_BREAK_MAX_SECONDS': '300',
+        'HOURLY_POST_CAP': '80',
+        'DAILY_POST_CAP': '600'
+    },
+    'standard': {
+        'MIN_DELAY_SECONDS': '6',
+        'MAX_DELAY_SECONDS': '12',
+        'LONG_BREAK_EVERY': '30',
+        'LONG_BREAK_MIN_SECONDS': '90',
+        'LONG_BREAK_MAX_SECONDS': '180',
+        'HOURLY_POST_CAP': '200',
+        'DAILY_POST_CAP': '1500'
+    },
+    'risky': {
+        'MIN_DELAY_SECONDS': '2',
+        'MAX_DELAY_SECONDS': '5',
+        'LONG_BREAK_EVERY': '60',
+        'LONG_BREAK_MIN_SECONDS': '60',
+        'LONG_BREAK_MAX_SECONDS': '120',
+        'HOURLY_POST_CAP': '400',
+        'DAILY_POST_CAP': '3000'
+    },
+    'max_risk': {
+        'MIN_DELAY_SECONDS': '0',
+        'MAX_DELAY_SECONDS': '0',
+        'LONG_BREAK_EVERY': '0',
+        'LONG_BREAK_MIN_SECONDS': '0',
+        'LONG_BREAK_MAX_SECONDS': '0',
+        'HOURLY_POST_CAP': '-1',
+        'DAILY_POST_CAP': '-1'
+    }
+}
+
+class SafetyPacer:
+    def __init__(self, cfg, seed_ts):
+        self.min_delay = int(cfg['MIN_DELAY_SECONDS'])
+        self.max_delay = int(cfg['MAX_DELAY_SECONDS'])
+        self.every = int(cfg['LONG_BREAK_EVERY'])
+        self.long_min = int(cfg['LONG_BREAK_MIN_SECONDS'])
+        self.long_max = int(cfg['LONG_BREAK_MAX_SECONDS'])
+        self.hour_cap = int(cfg['HOURLY_POST_CAP'])
+        self.day_cap = int(cfg['DAILY_POST_CAP'])
+        self.hour_q = deque()
+        self.day_q = deque()
+        now = time.time()
+        for t in (seed_ts or []):
+            if t >= now - 86400:
+                self.hour_q.append(t)
+                self.day_q.append(t)
+        self.success_count = 0
+
+    def _unlimited(self, cap): 
+        return cap < 0
+
+    def _prune(self):
+        now = time.time()
+        while self.hour_q and self.hour_q[0] <= now - 3600: 
+            self.hour_q.popleft()
+        while self.day_q and self.day_q[0] <= now - 86400: 
+            self.day_q.popleft()
+
+    def wait_caps(self):
+        if self._unlimited(self.hour_cap) and self._unlimited(self.day_cap):
+            return
+        while True:
+            self._prune()
+            now = time.time()
+            ok_hour = self._unlimited(self.hour_cap) or len(self.hour_q) < self.hour_cap
+            ok_day = self._unlimited(self.day_cap) or len(self.day_q) < self.day_cap
+            if ok_hour and ok_day:
+                return
+            sleeps = []
+            if not self._unlimited(self.hour_cap) and len(self.hour_q) >= self.hour_cap:
+                sleeps.append(self.hour_q[0] + 3600 - now)
+            if not self._unlimited(self.day_cap) and len(self.day_q) >= self.day_cap:
+                sleeps.append(self.day_q[0] + 86400 - now)
+            time.sleep(max(1, int(max(sleeps))))
+
+    def before_download(self):
+        self.wait_caps()
+        delay = random.uniform(self.min_delay, self.max_delay)
+        if self.max_delay > 0:
+            print(f"[SAFE] Sleeping {int(delay)}s before download...")
+            time.sleep(delay)
+
+    def after_success(self):
+        now = time.time()
+        if not self._unlimited(self.hour_cap): 
+            self.hour_q.append(now)
+        if not self._unlimited(self.day_cap):  
+            self.day_q.append(now)
+        self.success_count += 1
+        if self.every > 0 and (self.success_count % self.every == 0):
+            long_break = random.uniform(self.long_min, self.long_max)
+            if self.long_max > 0:
+                print(f"[SAFE] Long break: {int(long_break)}s")
+                time.sleep(long_break)
 
 # Helper to check if a file exists and is non-empty
 def file_exists_nonempty(path):
@@ -112,6 +230,256 @@ def are_cookies_valid(cookie_file=COOKIE_FILE):
         return False
 
 # --- End cookie logic ---
+
+# --- Config I/O helpers ---
+def load_config_with_structure():
+    """
+    Load config.txt into an ordered structure retaining original lines/comments.
+    
+    Returns:
+        dict: Config with 'lines' (list of original lines) and 'values' (dict of key-value pairs)
+    """
+    config = {'lines': [], 'values': {}}
+    
+    if not os.path.exists(CONFIG_FILE):
+        return config
+    
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
+            config['lines'].append(line.rstrip('\n'))
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, value = line.split('=', 1)
+                config['values'][key.strip()] = value.strip()
+    
+    return config
+
+def get_safety_config():
+    """
+    Get safety configuration values, normalizing legacy 0→-1 for caps.
+    
+    Returns:
+        dict: Safety configuration with normalized values
+    """
+    config = load_config_with_structure()
+    safety_config = {}
+    
+    for key in SAFETY_KEYS:
+        value = config['values'].get(key, '0')
+        # Normalize legacy 0 caps to -1
+        if key in ['HOURLY_POST_CAP', 'DAILY_POST_CAP'] and value == '0':
+            value = '-1'
+        safety_config[key] = value
+    
+    return safety_config
+
+def save_config(new_values):
+    """
+    Save config with new values.
+    
+    Args:
+        new_values: dict of key-value pairs to update
+    """
+    # Load current config
+    config = load_config_with_structure()
+    
+    # Separate safety keys from comments
+    safety_updates = {}
+    preset_comment = None
+    
+    for key, value in new_values.items():
+        if key.startswith('#'):
+            preset_comment = f"{key}={value}"
+        else:
+            safety_updates[key] = value
+            config['values'][key] = value
+    
+    # Write updated config
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        for line in config['lines']:
+            # Skip existing SAFETY_PRESET_APPLIED lines
+            if line.strip().startswith('# SAFETY_PRESET_APPLIED='):
+                continue
+            if line.strip() and '=' in line:
+                key = line.split('=', 1)[0].strip()
+                if key in safety_updates:
+                    # Update existing line
+                    f.write(f"{key}={safety_updates[key]}\n")
+                    continue
+            f.write(line + '\n')
+        
+        # Add any missing safety keys
+        for key, value in safety_updates.items():
+            if not any(key in line for line in config['lines']):
+                f.write(f"{key}={value}\n")
+        
+        # Add preset comment if provided
+        if preset_comment:
+            f.write(f"{preset_comment}\n")
+
+def _prompt_int(prompt_text, default=None, allow_blank=True, allow_minus1=False):
+	while True:
+		s = input(prompt_text).strip()
+		if s.lower() == 'b':
+			return 'BACK'
+		if s == '' and allow_blank:
+			return default
+		try:
+			val = int(s)
+			if allow_minus1 and val == -1:
+				return val
+			return val
+		except ValueError:
+			print("Enter an integer (or 'b' to go back).")
+
+def edit_delay_pair(cfg):
+	print("\nPer-download delay (seconds). Press Enter to keep current. 'b' = back.")
+	min_cur = int(cfg.get('MIN_DELAY_SECONDS', 0))
+	max_cur = int(cfg.get('MAX_DELAY_SECONDS', 0))
+
+	min_new = _prompt_int(f"  Min [{min_cur}]: ", default=min_cur)
+	if min_new == 'BACK': return False
+	max_new = _prompt_int(f"  Max [{max_cur}]: ", default=max_cur)
+	if max_new == 'BACK': return False
+
+	if min_new < 0 or max_new < 0:
+		print("  Min/Max must be ≥ 0.")
+		return edit_delay_pair(cfg)
+	if min_new > max_new:
+		resp = input(f"  Min {min_new} > Max {max_new}. Set Max to {min_new}? (y/N): ").strip().lower()
+		if resp == 'y':
+			max_new = min_new
+		else:
+			return edit_delay_pair(cfg)
+
+	cfg['MIN_DELAY_SECONDS'] = str(min_new)
+	cfg['MAX_DELAY_SECONDS'] = str(max_new)
+	return True
+
+def edit_long_break_pair(cfg):
+	print("\nLong break settings. 'Every' of 0 disables long breaks. 'b' = back.")
+	every_cur = int(cfg.get('LONG_BREAK_EVERY', 0))
+	every_new = _prompt_int(f"  Every N downloads [{every_cur}]: ", default=every_cur)
+	if every_new == 'BACK': return False
+
+	min_cur = int(cfg.get('LONG_BREAK_MIN_SECONDS', 0))
+	max_cur = int(cfg.get('LONG_BREAK_MAX_SECONDS', 0))
+
+	if every_new == 0:
+		cfg['LONG_BREAK_EVERY'] = '0'
+		cfg['LONG_BREAK_MIN_SECONDS'] = '0'
+		cfg['LONG_BREAK_MAX_SECONDS'] = '0'
+		return True
+
+	min_new = _prompt_int(f"  Break min seconds [{min_cur}]: ", default=min_cur)
+	if min_new == 'BACK': return False
+	max_new = _prompt_int(f"  Break max seconds [{max_cur}]: ", default=max_cur)
+	if max_new == 'BACK': return False
+
+	if min_new <= 0 or max_new <= 0:
+		print("  Break min/max must be > 0 when enabled.")
+		return edit_long_break_pair(cfg)
+	if min_new > max_new:
+		resp = input(f"  Break min {min_new} > max {max_new}. Set max to {min_new}? (y/N): ").strip().lower()
+		if resp == 'y':
+			max_new = min_new
+		else:
+			return edit_long_break_pair(cfg)
+
+	cfg['LONG_BREAK_EVERY'] = str(every_new)
+	cfg['LONG_BREAK_MIN_SECONDS'] = str(min_new)
+	cfg['LONG_BREAK_MAX_SECONDS'] = str(max_new)
+	return True
+
+def edit_hourly_cap(cfg):
+	print("\nHourly cap (-1 = No cap). 'b' = back.")
+	hr_cur = int(cfg.get('HOURLY_POST_CAP', -1))
+	hr_new = _prompt_int(f"  Hourly cap [{hr_cur}] (-1=no cap): ", default=hr_cur, allow_minus1=True)
+	if hr_new == 'BACK': return False
+	if hr_new == 0 or hr_new < -1:
+		print("  Cap must be -1 or ≥ 1 (0 invalid).")
+		return edit_hourly_cap(cfg)
+	cfg['HOURLY_POST_CAP'] = str(hr_new)
+	return True
+
+def edit_daily_cap(cfg):
+	print("\nDaily cap (-1 = No cap). 'b' = back.")
+	dy_cur = int(cfg.get('DAILY_POST_CAP', -1))
+	dy_new = _prompt_int(f"  Daily cap [{dy_cur}] (-1=no cap): ", default=dy_cur, allow_minus1=True)
+	if dy_new == 'BACK': return False
+	if dy_new == 0 or dy_new < -1:
+		print("  Cap must be -1 or ≥ 1 (0 invalid).")
+		return edit_daily_cap(cfg)
+	cfg['DAILY_POST_CAP'] = str(dy_new)
+	return True
+
+def validate_safety_config(config):
+    """
+    Validate safety configuration values.
+    
+    Args:
+        config: dict of safety configuration values
+        
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    try:
+        min_delay = int(config['MIN_DELAY_SECONDS'])
+        max_delay = int(config['MAX_DELAY_SECONDS'])
+        every = int(config['LONG_BREAK_EVERY'])
+        long_min = int(config['LONG_BREAK_MIN_SECONDS'])
+        long_max = int(config['LONG_BREAK_MAX_SECONDS'])
+        hour_cap = int(config['HOURLY_POST_CAP'])
+        day_cap = int(config['DAILY_POST_CAP'])
+        
+        # Validation rules
+        if min_delay < 0 or max_delay < 0:
+            return False, "Delays cannot be negative"
+        if min_delay > max_delay:
+            return False, "MIN_DELAY_SECONDS cannot be greater than MAX_DELAY_SECONDS"
+        if every < 0:
+            return False, "LONG_BREAK_EVERY cannot be negative"
+        if every > 0 and (long_min <= 0 or long_max <= 0):
+            return False, "Long break delays must be positive when enabled"
+        if every > 0 and long_min > long_max:
+            return False, "LONG_BREAK_MIN_SECONDS cannot be greater than LONG_BREAK_MAX_SECONDS"
+        if hour_cap == 0 or day_cap == 0:
+            return False, "Caps cannot be 0 (use -1 for no cap)"
+        if hour_cap < -1 or day_cap < -1:
+            return False, "Caps cannot be less than -1"
+        
+        return True, ""
+        
+    except ValueError as e:
+        return False, f"Invalid numeric value: {e}"
+
+def check_rate_limit_error(stderr):
+    """
+    Check if stderr contains rate limit or checkpoint patterns.
+    
+    Args:
+        stderr: Error output from yt-dlp or gallery-dl
+        
+    Returns:
+        bool: True if rate limit detected
+    """
+    if not stderr:
+        return False
+    
+    patterns = [
+        '429',
+        'please wait',
+        'rate limit',
+        'checkpoint',
+        'try again later',
+        'login required',
+        'temporarily blocked'
+    ]
+    
+    stderr_lower = stderr.lower()
+    return any(pattern in stderr_lower for pattern in patterns)
 
 def sanitize_filename(filename):
     """
@@ -267,7 +635,7 @@ def extract_dm_posts_and_profiles(dm_json_path):
     
     return posts, profiles
 
-def download_post(conn, post_data, download_dir):
+def download_post(conn, post_data, download_dir, pacer=None):
     """
     Download a single Instagram post using yt-dlp with fallback to gallery-dl.
     
@@ -275,6 +643,7 @@ def download_post(conn, post_data, download_dir):
         conn: Database connection
         post_data: Dictionary containing post information
         download_dir: Directory to save the download
+        pacer: SafetyPacer instance for rate limiting
         
     Returns:
         bool: True if download successful, False otherwise
@@ -290,6 +659,10 @@ def download_post(conn, post_data, download_dir):
     if is_downloaded(conn, shortcode):
         print(f"[SKIPPED] {shortcode} already recorded")
         return True
+    
+    # Safety pacing before download
+    if pacer:
+        pacer.before_download()
     
     # Generate filename
     filename_template = generate_filename(post_data)
@@ -310,11 +683,19 @@ def download_post(conn, post_data, download_dir):
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
+        # Check for rate limit errors
+        if result.returncode != 0 and check_rate_limit_error(result.stderr):
+            print("[SAFE] Rate limit or checkpoint detected. Halting for manual review.")
+            exit(1)
+        
         if result.returncode == 0:
             print(f"Successfully downloaded {shortcode}")
             status = record_download(conn, post_data)
             if status == "inserted":
                 print(f"[RECORDED] {shortcode} successfully")
+                # Safety pacing after success
+                if pacer:
+                    pacer.after_success()
             elif status == "duplicate":
                 print(f"[DUPLICATE] {shortcode} already in database")
             else:
@@ -340,11 +721,19 @@ def download_post(conn, post_data, download_dir):
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
+        # Check for rate limit errors
+        if result.returncode != 0 and check_rate_limit_error(result.stderr):
+            print("[SAFE] Rate limit or checkpoint detected. Halting for manual review.")
+            exit(1)
+        
         if result.returncode == 0:
             print(f"Successfully downloaded {shortcode} with gallery-dl")
             status = record_download(conn, post_data)
             if status == "inserted":
                 print(f"[RECORDED] {shortcode} successfully")
+                # Safety pacing after success
+                if pacer:
+                    pacer.after_success()
             elif status == "duplicate":
                 print(f"[DUPLICATE] {shortcode} already in database")
             else:
@@ -541,7 +930,7 @@ def get_profile_post_urls(username):
         print(f"[ERROR] Error using Selenium for @{username}: {e}")
         return [], {}
 
-def download_profile_posts(conn, username, download_dir, source='dm_profile'):
+def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None):
     """
     Download all posts from a user's profile using Selenium scraping.
     
@@ -550,6 +939,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile'):
         username: Instagram username
         download_dir: Directory to save downloads
         source: Source identifier for database
+        pacer: SafetyPacer instance for rate limiting
         
     Returns:
         bool: True if any posts were downloaded successfully
@@ -610,7 +1000,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile'):
             }
             
             # Use our existing download method
-            if download_post(conn, post_data_dict, profile_dir):
+            if download_post(conn, post_data_dict, profile_dir, pacer):
                 successful_downloads += 1
                 print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
             else:
@@ -629,13 +1019,14 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile'):
         print(f"[ERROR] Profile @{username} - {e}")
         return False
 
-def process_dm_download(conn, selected_path):
+def process_dm_download(conn, selected_path, pacer=None):
     """
     Process DM downloads from a selected profile dump.
     
     Args:
         conn: Database connection
         selected_path: Path to the selected profile dump
+        pacer: SafetyPacer instance for rate limiting
         
     Returns:
         bool: True if processing completed successfully
@@ -680,12 +1071,12 @@ def process_dm_download(conn, selected_path):
             if response == 'y':
                 for profile in profiles:
                     username = profile['username']
-                    download_profile_posts(conn, username, dm_download_dir, 'dm_profile')
+                    download_profile_posts(conn, username, dm_download_dir, 'dm_profile', pacer)
                     total_profiles += 1
         
         # Download shared posts
         for post in posts:
-            if download_post(conn, post, dm_download_dir):
+            if download_post(conn, post, dm_download_dir, pacer):
                 total_posts += 1
     
     print(f"\nDM download complete!")
@@ -809,6 +1200,7 @@ def print_page(dumps, dump_availability, page):
             print("n) Next page")
         if page > 0:
             print("p) Previous page")
+    print("c) Config Menu")
     print("q) Quit")
 
 def print_options_menu(avail):
@@ -824,8 +1216,128 @@ def print_options_menu(avail):
     print("\nAvailable download options:")
     for i, opt in enumerate(options, 1):
         print(f"{i}. {opt}")
+    print("c) Configuration")
     print("q) Quit")
     return options
+
+def view_safety_settings():
+    """Display current safety settings"""
+    config = get_safety_config()
+    
+    print("\n=== Safety Settings ===")
+    print(f"MIN_DELAY_SECONDS: {config['MIN_DELAY_SECONDS']}")
+    print(f"MAX_DELAY_SECONDS: {config['MAX_DELAY_SECONDS']}")
+    print(f"LONG_BREAK_EVERY: {config['LONG_BREAK_EVERY']}")
+    print(f"LONG_BREAK_MIN_SECONDS: {config['LONG_BREAK_MIN_SECONDS']}")
+    print(f"LONG_BREAK_MAX_SECONDS: {config['LONG_BREAK_MAX_SECONDS']}")
+    
+    hour_cap = config['HOURLY_POST_CAP']
+    day_cap = config['DAILY_POST_CAP']
+    print(f"HOURLY_POST_CAP: {hour_cap if hour_cap != '-1' else 'No cap'}")
+    print(f"DAILY_POST_CAP: {day_cap if day_cap != '-1' else 'No cap'}")
+
+def apply_safety_preset():
+    """Apply a safety preset"""
+    print("\n=== Safety Presets ===")
+    print("1. super_safe - Very conservative, minimal risk")
+    print("2. standard - Balanced safety and speed")
+    print("3. risky - Faster downloads, higher risk")
+    print("4. max_risk - No delays, maximum speed")
+    
+    while True:
+        choice = input("\nSelect preset (1-4) or b to back: ").strip().lower()
+        if choice == 'b':
+            return
+        
+        if choice in ['1', '2', '3', '4']:
+            preset_names = ['super_safe', 'standard', 'risky', 'max_risk']
+            preset_name = preset_names[int(choice) - 1]
+            preset_values = dict(SAFETY_PRESETS[preset_name])
+            
+            # Add preset comment
+            preset_values['# SAFETY_PRESET_APPLIED'] = preset_name
+            
+            try:
+                save_config(preset_values)
+                print(f"Applied {preset_name} preset successfully!")
+                return
+            except Exception as e:
+                print(f"Error applying preset: {e}")
+                return
+        
+        print("Invalid choice. Please enter 1-4 or b.")
+
+def edit_safety_values():
+    """Edit individual safety values with staged flow"""
+    cfg_current = get_safety_config()
+    pending = dict(cfg_current)
+    original_config = dict(cfg_current)
+    
+    print("\n=== Edit Safety Values ===")
+    print("Press 'b' at any prompt to go back and cancel all changes.")
+    
+    # Stage 1: Per-download delay (pair)
+    if not edit_delay_pair(pending):
+        return
+    
+    # Stage 2: Long break (pair)
+    if not edit_long_break_pair(pending):
+        return
+    
+    # Stage 3: Hourly cap (independent)
+    if not edit_hourly_cap(pending):
+        return
+    
+    # Stage 4: Daily cap (independent)
+    if not edit_daily_cap(pending):
+        return
+    
+    # Show summary of changes
+    changes = {}
+    for key in SAFETY_KEYS:
+        if pending[key] != original_config[key]:
+            changes[key] = (original_config[key], pending[key])
+    
+    if changes:
+        print("\n=== Changes Summary ===")
+        for key, (old_val, new_val) in changes.items():
+            print(f"{key}: {old_val} → {new_val}")
+        
+        save_choice = input("\nSave changes? (y/n): ").strip().lower()
+        if save_choice == 'y':
+            try:
+                # Add custom preset comment
+                pending['# SAFETY_PRESET_APPLIED'] = 'custom'
+                save_config(pending)
+                print("Changes saved successfully!")
+            except Exception as e:
+                print(f"Error saving changes: {e}")
+        else:
+            print("Changes discarded.")
+    else:
+        print("No changes made.")
+
+def settings_menu():
+    """Main settings menu"""
+    while True:
+        print("\n=== Settings ===")
+        print("1. View safety settings")
+        print("2. Apply safety preset")
+        print("3. Edit individual values")
+        print("b) Back to main menu")
+        
+        choice = input("\nEnter your choice: ").strip().lower()
+        
+        if choice == '1':
+            view_safety_settings()
+        elif choice == '2':
+            apply_safety_preset()
+        elif choice == '3':
+            edit_safety_values()
+        elif choice == 'b':
+            break
+        else:
+            print("Invalid choice. Please try again.")
 
 def main():
     config = read_config()
@@ -849,6 +1361,11 @@ def main():
         if first_check:
             print("Valid Instagram cookies found. Skipping login.")
         
+        # Initialize SafetyPacer
+        safety_config = get_safety_config()
+        recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
+        pacer = SafetyPacer(safety_config, recent_timestamps)
+        
         # Proceed to main script
         dumps = get_profile_dumps()
         if not dumps:
@@ -863,11 +1380,11 @@ def main():
         while True:
             print_page(dumps, dump_availability, page)
             if len(dumps) > PAGE_SIZE:
-                prompt_msg = "Enter your choice (number, n, p, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', or 'q'."
+                prompt_msg = "Enter your choice (number, n, p, c, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'n', 'p', 'c', or 'q'."
             else:
-                prompt_msg = "Enter your choice (number, q): "
-                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, or 'q'."
+                prompt_msg = "Enter your choice (number, c, q): "
+                invalid_msg = f"Invalid option. Please enter a number between 1 and {len(dumps)}, 'c', or 'q'."
             
             choice = input(prompt_msg).strip().lower()
             if choice.isdigit():
@@ -884,18 +1401,25 @@ def main():
                         continue
                     
                     while True:
-                        opt_choice = input("Enter your choice (number or q): ").strip().lower()
+                        opt_choice = input("Enter your choice (number, c, or q): ").strip().lower()
                         if opt_choice == 'q':
                             break
-                        if opt_choice.isdigit():
+                        elif opt_choice == 'c':
+                            settings_menu()
+                            # Refresh safety config after settings change
+                            safety_config = get_safety_config()
+                            recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
+                            pacer = SafetyPacer(safety_config, recent_timestamps)
+                            continue
+                        elif opt_choice.isdigit():
                             opt_num = int(opt_choice)
-                            if 1 <= opt_num <= len(options):
+                            if 1 <= opt_num <= len(options) - 1:  # -1 because we added 's' Settings
                                 selected_option = options[opt_num-1]
                                 print(f"You selected: {selected_option}")
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
-                                    process_dm_download(conn, selected_path)
+                                    process_dm_download(conn, selected_path, pacer)
                                 elif "Profile Posts Download" in selected_option:
                                     print("Profile posts download not yet implemented")
                                 elif "Liked Posts Download" in selected_option:
@@ -912,9 +1436,9 @@ def main():
                                 input("Press Enter to return to main menu...")
                                 break
                             else:
-                                print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
+                                print(f"Invalid option. Please enter a number between 1 and {len(options)-1}, 'c', or 'q'.")
                         else:
-                            print(f"Invalid option. Please enter a number between 1 and {len(options)}, or 'q'.")
+                            print(f"Invalid option. Please enter a number between 1 and {len(options)-1}, 'c', or 'q'.")
                     break
                 else:
                     print(invalid_msg)
@@ -923,6 +1447,12 @@ def main():
                 page += 1
             elif len(dumps) > PAGE_SIZE and choice == 'p' and page > 0:
                 page -= 1
+            elif choice == 'c':
+                settings_menu()
+                # Refresh safety config after settings change
+                safety_config = get_safety_config()
+                recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
+                pacer = SafetyPacer(safety_config, recent_timestamps)
             elif choice == 'q':
                 print("Quitting.")
                 break
