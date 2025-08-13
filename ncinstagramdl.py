@@ -947,10 +947,6 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
     print(f"[PROFILE] Downloading all posts from @{username}")
     
     try:
-        # Create profile-specific folder
-        profile_dir = os.path.join(download_dir, "profiles", sanitize_filename(username))
-        os.makedirs(profile_dir, exist_ok=True)
-        
         # First, get all post URLs from the profile using Selenium
         result = get_profile_post_urls(username)
         
@@ -963,6 +959,10 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         if not post_urls:
             print(f"[FAILED] No post URLs found for @{username}")
             return False
+        
+        # Only create profile-specific folder if we actually have posts to download
+        profile_dir = os.path.join(download_dir, sanitize_filename(username))
+        os.makedirs(profile_dir, exist_ok=True)
         
         print(f"[PROFILE] Found {len(post_urls)} posts to download for @{username}")
         
@@ -1050,9 +1050,15 @@ def process_dm_download(conn, selected_path, pacer=None):
     
     print(f"Found {len(message_files)} message files to process")
     
-    # Create download directory
-    dm_download_dir = os.path.join(selected_path, "downloads", "dms")
+    # Get download directory from config
+    config = read_config()
+    download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+    
+    # Create download directory structure
+    dm_download_dir = os.path.join(download_base_dir, "dms")
     os.makedirs(dm_download_dir, exist_ok=True)
+    
+    print(f"Downloads will be saved to: {dm_download_dir}")
     
     total_posts = 0
     total_profiles = 0
@@ -1069,10 +1075,17 @@ def process_dm_download(conn, selected_path, pacer=None):
         if profiles:
             response = input(f"This DM includes {len(profiles)} shared profiles. Download all their posts? (y/n): ").strip().lower()
             if response == 'y':
+                # Create profile downloads directory only when user chooses to download
+                profile_download_dir = os.path.join(dm_download_dir, "full_profiles")
+                os.makedirs(profile_download_dir, exist_ok=True)
+                print(f"Profile downloads will be saved to: {profile_download_dir}")
+                
                 for profile in profiles:
                     username = profile['username']
-                    download_profile_posts(conn, username, dm_download_dir, 'dm_profile', pacer)
+                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer)
                     total_profiles += 1
+            else:
+                print("Skipping profile downloads as requested.")
         
         # Download shared posts
         for post in posts:
