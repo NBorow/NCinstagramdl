@@ -132,8 +132,26 @@ class SafetyPacer:
         self.wait_caps()
         delay = random.uniform(self.min_delay, self.max_delay)
         if self.max_delay > 0:
-            print(f"[SAFE] Sleeping {int(delay)}s before download...")
-            time.sleep(delay)
+            print(f"[SAFE] Sleeping {int(delay)}s before download... (Press Enter to skip)")
+            # Use a shorter sleep interval to check for user input
+            remaining = delay
+            while remaining > 0:
+                sleep_interval = min(1.0, remaining)  # Check every second or remaining time
+                time.sleep(sleep_interval)
+                remaining -= sleep_interval
+                
+                # Check if user pressed Enter (non-blocking input check)
+                try:
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        if key == b'\r':  # Enter key
+                            print("[SAFE] Break skipped by user")
+                            break
+                except ImportError:
+                    # On non-Windows systems, we can't do non-blocking input easily
+                    # Just continue with the sleep
+                    pass
 
     def after_success(self):
         now = time.time()
@@ -145,8 +163,26 @@ class SafetyPacer:
         if self.every > 0 and (self.success_count % self.every == 0):
             long_break = random.uniform(self.long_min, self.long_max)
             if self.long_max > 0:
-                print(f"[SAFE] Long break: {int(long_break)}s")
-                time.sleep(long_break)
+                print(f"[SAFE] Long break: {int(long_break)}s (Press Enter to skip)")
+                # Use a shorter sleep interval to check for user input
+                remaining = long_break
+                while remaining > 0:
+                    sleep_interval = min(1.0, remaining)  # Check every second or remaining time
+                    time.sleep(sleep_interval)
+                    remaining -= sleep_interval
+                    
+                    # Check if user pressed Enter (non-blocking input check)
+                    try:
+                        import msvcrt
+                        if msvcrt.kbhit():
+                            key = msvcrt.getch()
+                            if key == b'\r':  # Enter key
+                                print("[SAFE] Long break skipped by user")
+                                break
+                    except ImportError:
+                        # On non-Windows systems, we can't do non-blocking input easily
+                        # Just continue with the sleep
+                        pass
 
 # Helper to check if a file exists and is non-empty
 def file_exists_nonempty(path):
@@ -575,12 +611,13 @@ def extract_shortcode_from_url(url):
     
     return None
 
-def extract_dm_posts_and_profiles(dm_json_path):
+def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     """
     Extract posts and profiles from DM JSON file.
     
     Args:
         dm_json_path: Path to message_1.json file
+        thread_name: Name of the DM thread/conversation
         
     Returns:
         tuple: (posts_list, profiles_list)
@@ -626,7 +663,8 @@ def extract_dm_posts_and_profiles(dm_json_path):
                             'share_text': share.get('share_text', ''),
                             'caption': None,  # Currently not available in DM shares
                             'timestamp_ms': message.get('timestamp_ms', 0),
-                            'source': 'dm'
+                            'source': 'dm',
+                            'dm_thread': thread_name
                         }
                         posts.append(post_data)
     
@@ -711,11 +749,22 @@ def download_post(conn, post_data, download_dir, pacer=None):
     
     # Fallback to gallery-dl
     try:
+        # Create gallery-dl specific filename template with proper extension handling
+        # gallery-dl uses {extension} instead of %(ext)s
+        # For carousels, we want: shortcode/shortcode_{num}.{extension} (creates folder)
+        # For single posts, we want: shortcode.{extension} (no folder)
+        base_filename = filename_template.replace('.%(ext)s', '')
+        
+        # Use the actual shortcode for folder creation
+        # This should create a folder named after the post for carousels
+        shortcode = post_data.get('shortcode', 'unknown')
+        gallery_filename = f'{shortcode}/{{shortcode}}_{{num}}.{{extension}}'
+
         cmd = [
             'gallery-dl',
             '--cookies', COOKIE_FILE,
-            '--dest', download_dir,
-            '--filename', filename_template,
+            '--directory', download_dir,  # Force exact directory, no subfolders
+            '--filename', gallery_filename,
             url
         ]
         
@@ -756,6 +805,20 @@ def download_post(conn, post_data, download_dir, pacer=None):
         print(f"[DUPLICATE] {shortcode} failure already recorded")
     else:
         print(f"[ERROR] {shortcode} → database error recording failure")
+    
+    # Log total failure to file for debugging
+    try:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}\n"
+        
+        with open("total_failures.log", "a", encoding="utf-8") as f:
+            f.write(failure_log_entry)
+        
+        print(f"[DEBUG] Total failure logged to total_failures.log")
+    except Exception as e:
+        print(f"[DEBUG] Failed to log to file: {e}")
+    
     return False
 
 
@@ -930,7 +993,7 @@ def get_profile_post_urls(username):
         print(f"[ERROR] Error using Selenium for @{username}: {e}")
         return [], {}
 
-def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None):
+def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None):
     """
     Download all posts from a user's profile using Selenium scraping.
     
@@ -940,6 +1003,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         download_dir: Directory to save downloads
         source: Source identifier for database
         pacer: SafetyPacer instance for rate limiting
+        thread_name: DM thread name for database tracking
         
     Returns:
         bool: True if any posts were downloaded successfully
@@ -996,7 +1060,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 'share_text': '',
                 'caption': post_caption,
                 'timestamp_ms': int(time.time() * 1000),
-                'source': source
+                'source': source,
+                'dm_thread': thread_name
             }
             
             # Use our existing download method
@@ -1048,7 +1113,35 @@ def process_dm_download(conn, selected_path, pacer=None):
         print("No message files found in DM inbox")
         return False
     
-    print(f"Found {len(message_files)} message files to process")
+    print(f"Found {len(message_files)} DM conversations")
+    
+    # Display available DM conversations
+    print("\nAvailable DM conversations:")
+    for i, msg_file in enumerate(message_files, 1):
+        thread_name = os.path.basename(os.path.dirname(msg_file))
+        print(f"{i}. {thread_name}")
+    print("a) Download all conversations")
+    print("q) Quit")
+    
+    # Get user selection
+    while True:
+        choice = input("\nSelect which conversation(s) to download (number, 'a' for all, or 'q' to quit): ").strip().lower()
+        
+        if choice == 'q':
+            print("Cancelled DM download.")
+            return False
+        elif choice == 'a':
+            selected_files = message_files
+            break
+        elif choice.isdigit():
+            num = int(choice)
+            if 1 <= num <= len(message_files):
+                selected_files = [message_files[num - 1]]
+                break
+            else:
+                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', or 'q'.")
+        else:
+            print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', or 'q'.")
     
     # Get download directory from config
     config = read_config()
@@ -1063,11 +1156,12 @@ def process_dm_download(conn, selected_path, pacer=None):
     total_posts = 0
     total_profiles = 0
     
-    for msg_file in message_files:
-        print(f"\nProcessing {os.path.basename(os.path.dirname(msg_file))}...")
+    for msg_file in selected_files:
+        thread_name = os.path.basename(os.path.dirname(msg_file))
+        print(f"\nProcessing {thread_name}...")
         
         # Extract posts and profiles
-        posts, profiles = extract_dm_posts_and_profiles(msg_file)
+        posts, profiles = extract_dm_posts_and_profiles(msg_file, thread_name)
         
         print(f"Found {len(posts)} shared posts and {len(profiles)} shared profiles")
         
@@ -1082,13 +1176,14 @@ def process_dm_download(conn, selected_path, pacer=None):
                 
                 for profile in profiles:
                     username = profile['username']
-                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer)
+                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name)
                     total_profiles += 1
             else:
                 print("Skipping profile downloads as requested.")
         
         # Download shared posts
-        for post in posts:
+        for i, post in enumerate(posts, 1):
+            print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
             if download_post(conn, post, dm_download_dir, pacer):
                 total_posts += 1
     
@@ -1426,7 +1521,7 @@ def main():
                             continue
                         elif opt_choice.isdigit():
                             opt_num = int(opt_choice)
-                            if 1 <= opt_num <= len(options) - 1:  # -1 because we added 's' Settings
+                            if 1 <= opt_num <= len(options):
                                 selected_option = options[opt_num-1]
                                 print(f"You selected: {selected_option}")
                                 
@@ -1449,9 +1544,9 @@ def main():
                                 input("Press Enter to return to main menu...")
                                 break
                             else:
-                                print(f"Invalid option. Please enter a number between 1 and {len(options)-1}, 'c', or 'q'.")
+                                print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'c', or 'q'.")
                         else:
-                            print(f"Invalid option. Please enter a number between 1 and {len(options)-1}, 'c', or 'q'.")
+                            print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'c', or 'q'.")
                     break
                 else:
                     print(invalid_msg)
