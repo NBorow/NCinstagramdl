@@ -34,7 +34,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
             timestamp_ms INTEGER,
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'success', -- 'success', 'failed', 'skipped'
-            error_message TEXT
+            error_message TEXT,
+            dm_thread TEXT
         )
     ''')
     
@@ -48,6 +49,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute('''
         CREATE INDEX IF NOT EXISTS idx_posts_source 
         ON posts(source)
+    ''')
+    
+    # Create index on source and dm_thread for DM filtering
+    conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_posts_source_dmthread 
+        ON posts(source, dm_thread)
     ''')
     
     conn.commit()
@@ -109,8 +116,8 @@ def record_download(conn: sqlite3.Connection, post: Dict) -> str:
         conn.execute('''
             INSERT OR IGNORE INTO posts 
             (shortcode, url, description, original_owner, share_text, 
-             source, username, timestamp_ms, status, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source, username, timestamp_ms, status, downloaded_at, dm_thread)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             post.get('shortcode'),
             post.get('url'),
@@ -121,7 +128,8 @@ def record_download(conn: sqlite3.Connection, post: Dict) -> str:
             post.get('username'),
             post.get('timestamp_ms'),
             post.get('status', 'success'),
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            post.get('dm_thread')
         ))
         
         conn.commit()
@@ -154,8 +162,8 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
         conn.execute('''
             INSERT OR IGNORE INTO posts 
             (shortcode, url, description, original_owner, share_text, 
-             source, username, timestamp_ms, status, error_message, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             source, username, timestamp_ms, status, error_message, downloaded_at, dm_thread)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             post.get('shortcode'),
             post.get('url'),
@@ -167,7 +175,8 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
             post.get('timestamp_ms'),
             'failed',
             error,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            post.get('dm_thread')
         ))
         
         conn.commit()
