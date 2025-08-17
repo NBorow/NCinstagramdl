@@ -1257,19 +1257,19 @@ def prompt_for_credentials(config):
         if not username:
             username = input('Enter Instagram username: ').strip()
         if not password:
-            password = input('Enter Instagram password (visible): ').strip()
-        print(f"[DEBUG] Username entered: {repr(username)}")
-        print(f"[DEBUG] Password entered: {repr(password)}")
+            password = getpass.getpass('Enter Instagram password: ')
+        # print(f"[DEBUG] Username entered: {repr(username)}")
+        # print(f"[DEBUG] Password entered: {repr(password)}")
         if verify_login_selenium_and_save_cookies(username, password):
             return username, password
         else:
             print('Login failed. Restart script if confident on credentials.')
             if config_username:
                 # Only prompt for password again if username was from config.txt
-                password = input('Enter Instagram password (visible): ').strip()
+                password = getpass.getpass('Enter Instagram password: ')
             else:
                 username = input('Enter Instagram username: ').strip()
-                password = input('Enter Instagram password (visible): ').strip()
+                password = getpass.getpass('Enter Instagram password: ')
 
 def get_profile_dumps_dir():
     config = read_config()
