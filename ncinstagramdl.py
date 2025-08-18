@@ -45,6 +45,15 @@ SAFETY_KEYS = [
 ]
 
 SAFETY_PRESETS = {
+    'super_duper_schizo_safe': {
+        'MIN_DELAY_SECONDS': '60',
+        'MAX_DELAY_SECONDS': '120',
+        'LONG_BREAK_EVERY': '5',
+        'LONG_BREAK_MIN_SECONDS': '200',
+        'LONG_BREAK_MAX_SECONDS': '400',
+        'HOURLY_POST_CAP': '30',
+        'DAILY_POST_CAP': '550'
+    },
     'super_safe': {
         'MIN_DELAY_SECONDS': '20',
         'MAX_DELAY_SECONDS': '40',
@@ -1347,18 +1356,19 @@ def view_safety_settings():
 def apply_safety_preset():
     """Apply a safety preset"""
     print("\n=== Safety Presets ===")
-    print("1. super_safe - Very conservative, minimal risk")
-    print("2. standard - Balanced safety and speed")
-    print("3. risky - Faster downloads, higher risk")
-    print("4. max_risk - No delays, maximum speed")
+    print("1. super_duper_schizo_safe - Ultra conservative, maximum human-like behavior")
+    print("2. super_safe - Very conservative, minimal risk")
+    print("3. standard - Balanced safety and speed")
+    print("4. risky - Faster downloads, higher risk")
+    print("5. max_risk - No delays, maximum speed")
     
     while True:
-        choice = input("\nSelect preset (1-4) or b to back: ").strip().lower()
+        choice = input("\nSelect preset (1-5) or b to back: ").strip().lower()
         if choice == 'b':
             return
         
-        if choice in ['1', '2', '3', '4']:
-            preset_names = ['super_safe', 'standard', 'risky', 'max_risk']
+        if choice in ['1', '2', '3', '4', '5']:
+            preset_names = ['super_duper_schizo_safe', 'super_safe', 'standard', 'risky', 'max_risk']
             preset_name = preset_names[int(choice) - 1]
             preset_values = dict(SAFETY_PRESETS[preset_name])
             
@@ -1373,7 +1383,7 @@ def apply_safety_preset():
                 print(f"Error applying preset: {e}")
                 return
         
-        print("Invalid choice. Please enter 1-4 or b.")
+        print("Invalid choice. Please enter 1-5 or b.")
 
 def edit_safety_values():
     """Edit individual safety values with staged flow"""
