@@ -1374,15 +1374,19 @@ def process_dm_download(conn, selected_path, pacer=None):
         thread_name = os.path.basename(os.path.dirname(msg_file))
         print(f"{i}. {thread_name}")
     print("a) Download all conversations")
+    print("b) Back to options menu")
     print("q) Quit")
     
     # Get user selection
     while True:
-        choice = input("\nSelect which conversation(s) to download (number, 'a' for all, or 'q' to quit): ").strip().lower()
+        choice = input("\nSelect which conversation(s) to download (number, 'a' for all, 'b' for back, or 'q' to quit): ").strip().lower()
         
         if choice == 'q':
-            print("Cancelled DM download.")
+            print("Quitting.")
             return False
+        elif choice == 'b':
+            print("Returning to options menu.")
+            return None  # Special return value to indicate "back"
         elif choice == 'a':
             selected_files = message_files
             break
@@ -1392,9 +1396,9 @@ def process_dm_download(conn, selected_path, pacer=None):
                 selected_files = [message_files[num - 1]]
                 break
             else:
-                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', or 'q'.")
+                print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
         else:
-            print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', or 'q'.")
+            print(f"Invalid choice. Please enter a number between 1 and {len(message_files)}, 'a', 'b', or 'q'.")
     
     # Get download directory from config
     config = read_config()
@@ -1516,7 +1520,7 @@ def print_options_menu(avail):
     print("\nAvailable download options:")
     for i, opt in enumerate(options, 1):
         print(f"{i}. {opt}")
-    print("c) Configuration")
+    print("b) Back to main menu")
     print("q) Quit")
     return options
 
@@ -1633,6 +1637,7 @@ def settings_menu():
         print("2. Apply safety preset")
         print("3. Edit individual values")
         print("b) Back to main menu")
+        print("q) Quit")
         
         choice = input("\nEnter your choice: ").strip().lower()
         
@@ -1644,6 +1649,9 @@ def settings_menu():
             edit_safety_values()
         elif choice == 'b':
             break
+        elif choice == 'q':
+            print("Quitting.")
+            exit(0)
         else:
             print("Invalid choice. Please try again.")
 
@@ -1700,16 +1708,12 @@ def main():
                         continue
                     
                     while True:
-                        opt_choice = input("Enter your choice (number, c, or q): ").strip().lower()
+                        opt_choice = input("Enter your choice (number, b, or q): ").strip().lower()
                         if opt_choice == 'q':
+                            print("Quitting.")
+                            return
+                        elif opt_choice == 'b':
                             break
-                        elif opt_choice == 'c':
-                            settings_menu()
-                            # Refresh safety config after settings change
-                            safety_config = get_safety_config()
-                            recent_timestamps = get_recent_download_timestamps(conn, time.time() - 86400)
-                            pacer = SafetyPacer(safety_config, recent_timestamps)
-                            continue
                         elif opt_choice.isdigit():
                             opt_num = int(opt_choice)
                             if 1 <= opt_num <= len(options):
@@ -1718,27 +1722,40 @@ def main():
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
-                                    process_dm_download(conn, selected_path, pacer)
+                                    result = process_dm_download(conn, selected_path, pacer)
+                                    if result is True:
+                                        # Print download statistics only if completed
+                                        print("\nDownload Statistics:")
+                                        stats = get_download_stats(conn)
+                                        for key, value in stats.items():
+                                            print(f"  {key}: {value}")
+                                        input("Press Enter to return to main menu...")
+                                        break
+                                    elif result is False:
+                                        # User quit the program
+                                        return
+                                    elif result is None:
+                                        # User chose back, re-display options menu
+                                        print_options_menu(avail)
+                                        continue
                                 elif "Profile Posts Download" in selected_option:
                                     print("Profile posts download not yet implemented")
+                                    input("Press Enter to return to main menu...")
+                                    break
                                 elif "Liked Posts Download" in selected_option:
                                     print("Liked posts download not yet implemented")
+                                    input("Press Enter to return to main menu...")
+                                    break
                                 elif "Saved Posts Download" in selected_option:
                                     print("Saved posts download not yet implemented")
-                                
-                                # Print download statistics
-                                print("\nDownload Statistics:")
-                                stats = get_download_stats(conn)
-                                for key, value in stats.items():
-                                    print(f"  {key}: {value}")
-                                
-                                input("Press Enter to return to main menu...")
-                                break
+                                    input("Press Enter to return to main menu...")
+                                    break
                             else:
-                                print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'c', or 'q'.")
+                                print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'b', or 'q'.")
                         else:
-                            print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'c', or 'q'.")
-                    break
+                            print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'b', or 'q'.")
+                    # If we broke out of the inner loop, continue to the outer loop (back to main menu)
+                    continue
                 else:
                     print(invalid_msg)
                     input("Press Enter to continue...")
