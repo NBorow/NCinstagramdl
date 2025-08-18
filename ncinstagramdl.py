@@ -310,7 +310,8 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 	options.add_argument("--disable-blink-features=AutomationControlled")
 	options.add_argument("--no-first-run")
 	options.add_argument("--no-default-browser-check")
-	options.add_argument("--start-maximized")
+	options.add_argument("--window-size=1200,800")
+	options.add_argument("--window-position=100,100")
 	options.add_experimental_option("excludeSwitches", ["enable-automation"])
 	options.add_experimental_option('useAutomationExtension', False)
 	options.add_argument("--disable-dev-shm-usage")
@@ -324,6 +325,9 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 	options.add_argument("--disable-dev-shm-usage")
 	options.add_argument("--disable-gpu-sandbox")
 	options.add_argument("--disable-software-rasterizer")
+	options.add_argument("--disable-background-timer-throttling")
+	options.add_argument("--disable-backgrounding-occluded-windows")
+	options.add_argument("--disable-renderer-backgrounding")
 
 	driver = None
 	try:
@@ -365,7 +369,8 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 	options.add_argument("--disable-blink-features=AutomationControlled")
 	options.add_argument("--no-first-run")
 	options.add_argument("--no-default-browser-check")
-	options.add_argument("--start-maximized")
+	options.add_argument("--window-size=1200,800")
+	options.add_argument("--window-position=100,100")
 	options.add_experimental_option("excludeSwitches", ["enable-automation"])
 	options.add_experimental_option('useAutomationExtension', False)
 	options.add_argument("--disable-dev-shm-usage")
@@ -379,6 +384,9 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 	options.add_argument("--disable-dev-shm-usage")
 	options.add_argument("--disable-gpu-sandbox")
 	options.add_argument("--disable-software-rasterizer")
+	options.add_argument("--disable-background-timer-throttling")
+	options.add_argument("--disable-backgrounding-occluded-windows")
+	options.add_argument("--disable-renderer-backgrounding")
 	
 	driver = None
 	try:
