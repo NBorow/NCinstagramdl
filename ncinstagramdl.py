@@ -26,6 +26,25 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
 PAGE_SIZE = 10
 
+# --- Config parsing helpers for manual login ---
+def parse_bool(s: str, default: bool) -> bool:
+	if s is None: return default
+	return s.strip().lower() in ("1","true","yes","y","on")
+
+def normalize_profile_dir(raw: str) -> str:
+	script_dir = os.path.dirname(__file__)
+	if not raw or not raw.strip():
+		# default if not provided
+		return os.path.join(script_dir, "profiles", "active")
+	p = raw.strip().strip('"').strip("'")
+	p = os.path.expandvars(os.path.expanduser(p))
+	return p  # accept absolute or relative; user will typically provide absolute (e.g., C:\Users\you\ig_profile)
+
+def resolve_profile_and_cookie(config):
+	profile_dir = normalize_profile_dir(config.get("PROFILE_DIR"))
+	cookie_file = COOKIE_FILE
+	return profile_dir, cookie_file
+
 # --- New: Profile dump scan logic ---
 PROFILE_POSTS_PATH = os.path.join('your_instagram_activity', 'media', 'posts_1.json')
 LIKED_PATH = os.path.join('your_instagram_activity', 'likes', 'liked_posts.json')
@@ -41,7 +60,8 @@ SAFETY_KEYS = [
     'LONG_BREAK_MIN_SECONDS',
     'LONG_BREAK_MAX_SECONDS',
     'HOURLY_POST_CAP',
-    'DAILY_POST_CAP'
+    'DAILY_POST_CAP',
+    'SAFER_MANUAL_LOGIN'
 ]
 
 SAFETY_PRESETS = {
@@ -52,7 +72,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MIN_SECONDS': '200',
         'LONG_BREAK_MAX_SECONDS': '400',
         'HOURLY_POST_CAP': '30',
-        'DAILY_POST_CAP': '550'
+        'DAILY_POST_CAP': '550',
+        'SAFER_MANUAL_LOGIN': 'true'
     },
     'super_safe': {
         'MIN_DELAY_SECONDS': '20',
@@ -61,7 +82,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MIN_SECONDS': '180',
         'LONG_BREAK_MAX_SECONDS': '300',
         'HOURLY_POST_CAP': '80',
-        'DAILY_POST_CAP': '600'
+        'DAILY_POST_CAP': '600',
+        'SAFER_MANUAL_LOGIN': 'true'
     },
     'standard': {
         'MIN_DELAY_SECONDS': '6',
@@ -70,7 +92,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MIN_SECONDS': '90',
         'LONG_BREAK_MAX_SECONDS': '180',
         'HOURLY_POST_CAP': '200',
-        'DAILY_POST_CAP': '1500'
+        'DAILY_POST_CAP': '1500',
+        'SAFER_MANUAL_LOGIN': 'false'
     },
     'risky': {
         'MIN_DELAY_SECONDS': '2',
@@ -79,7 +102,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MIN_SECONDS': '60',
         'LONG_BREAK_MAX_SECONDS': '120',
         'HOURLY_POST_CAP': '400',
-        'DAILY_POST_CAP': '3000'
+        'DAILY_POST_CAP': '3000',
+        'SAFER_MANUAL_LOGIN': 'false'
     },
     'max_risk': {
         'MIN_DELAY_SECONDS': '0',
@@ -88,7 +112,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MIN_SECONDS': '0',
         'LONG_BREAK_MAX_SECONDS': '0',
         'HOURLY_POST_CAP': '-1',
-        'DAILY_POST_CAP': '-1'
+        'DAILY_POST_CAP': '-1',
+        'SAFER_MANUAL_LOGIN': 'false'
     }
 }
 
@@ -276,6 +301,164 @@ def are_cookies_valid(cookie_file=COOKIE_FILE):
 
 # --- End cookie logic ---
 
+# --- Manual login with persistent Chrome profile ---
+def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
+	os.makedirs(profile_dir, exist_ok=True)
+
+	options = Options()
+	options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")  # persistent profile
+	options.add_argument("--disable-blink-features=AutomationControlled")
+	options.add_argument("--no-first-run")
+	options.add_argument("--no-default-browser-check")
+	options.add_argument("--start-maximized")
+	options.add_experimental_option("excludeSwitches", ["enable-automation"])
+	options.add_experimental_option('useAutomationExtension', False)
+	options.add_argument("--disable-dev-shm-usage")
+	options.add_argument("--no-sandbox")
+	options.add_argument("--disable-gpu")
+	options.add_argument("--disable-web-security")
+	options.add_argument("--disable-features=VizDisplayCompositor")
+	options.add_argument("--log-level=3")
+	options.add_argument("--silent")
+	options.add_argument("--disable-logging")
+	options.add_argument("--disable-dev-shm-usage")
+	options.add_argument("--disable-gpu-sandbox")
+	options.add_argument("--disable-software-rasterizer")
+
+	driver = None
+	try:
+		service = Service(ChromeDriverManager().install())
+		driver = webdriver.Chrome(service=service, options=options)
+
+		driver.get("https://www.instagram.com/accounts/login/")
+		
+		# Remove automation banner if present
+		try:
+			driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+		except:
+			pass
+		
+		print("\n" + "="*60)
+		print("[Manual Login] Chrome opened with profile:", profile_dir)
+		print("[Manual Login] Log in manually. Complete any 2FA/checkpoints.")
+		print("="*60)
+		input("\n[Manual Login] ⚠️  When your feed/profile is visible, press ENTER here... ")
+
+		driver.get("https://www.instagram.com/")
+		time.sleep(2)
+
+		save_cookies_netscape(driver, cookie_file)
+		print(f"[Manual Login] Cookies exported → {cookie_file}")
+		return True
+	except Exception as e:
+		print(f"[Manual Login] Error: {e}")
+		return False
+	finally:
+		try:
+			if driver: driver.quit()
+		except:
+			pass
+
+def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: str) -> bool:
+	options = Options()
+	options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
+	options.add_argument("--disable-blink-features=AutomationControlled")
+	options.add_argument("--no-first-run")
+	options.add_argument("--no-default-browser-check")
+	options.add_argument("--start-maximized")
+	options.add_experimental_option("excludeSwitches", ["enable-automation"])
+	options.add_experimental_option('useAutomationExtension', False)
+	options.add_argument("--disable-dev-shm-usage")
+	options.add_argument("--no-sandbox")
+	options.add_argument("--disable-gpu")
+	options.add_argument("--disable-web-security")
+	options.add_argument("--disable-features=VizDisplayCompositor")
+	options.add_argument("--log-level=3")
+	options.add_argument("--silent")
+	options.add_argument("--disable-logging")
+	options.add_argument("--disable-dev-shm-usage")
+	options.add_argument("--disable-gpu-sandbox")
+	options.add_argument("--disable-software-rasterizer")
+	
+	driver = None
+	try:
+		service = Service(ChromeDriverManager().install())
+		driver = webdriver.Chrome(service=service, options=options)
+		
+		driver.get('https://www.instagram.com/accounts/login/')
+		
+		# Remove automation banner if present
+		try:
+			driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+		except:
+			pass
+		
+		time.sleep(2)
+		
+		username = config.get('USERNAME')
+		password = config.get('PASSWORD')
+		
+		if not username or not password:
+			print("[Auto Login] Missing username or password in config")
+			return False
+		
+		username_field = driver.find_element('name', 'username')
+		username_field.clear()
+		username_field.send_keys(username)
+		password_field = driver.find_element('name', 'password')
+		password_field.clear()
+		password_field.send_keys(password)
+		password_field.submit()
+		time.sleep(4)
+		
+		if 'login' not in driver.current_url.lower():
+			print('[Auto Login] Login successful, saving cookies!')
+			save_cookies_netscape(driver, cookie_file)
+			return True
+		
+		page_source = driver.page_source
+		if 'The username you entered doesn\'t belong to an account' in page_source or 'Sorry, your password was incorrect' in page_source:
+			print('[Auto Login] Login failed: incorrect username or password.')
+			return False
+		
+		print('[Auto Login] Login failed: still on login page.')
+		return False
+		
+	except Exception as e:
+		print(f"[Auto Login] Exception during Selenium login: {e}")
+		return False
+	finally:
+		try:
+			if driver: driver.quit()
+		except:
+			pass
+
+def ensure_valid_cookies(config) -> bool:
+	profile_dir, cookie_file = resolve_profile_and_cookie(config)
+	SAFER_MANUAL_LOGIN = parse_bool(config.get("SAFER_MANUAL_LOGIN"), True)
+	
+	if are_cookies_valid(cookie_file):
+		print("Valid cookies found. Skipping login.")
+		return True
+
+	if SAFER_MANUAL_LOGIN:
+		print("SAFER_MANUAL_LOGIN is ON → manual login.")
+		while True:
+			if manual_login_and_export_cookies(profile_dir, cookie_file) and are_cookies_valid(cookie_file):
+				return True
+			print("[WARN] Cookies still invalid. Finish login in Chrome and press ENTER again.")
+	else:
+		print("SAFER_MANUAL_LOGIN is OFF → attempting automated login (max 3 tries).")
+		for attempt in range(1, 4):
+			print(f"[Auto Login] Attempt {attempt}/3...")
+			if automated_login_and_export_cookies(config, profile_dir, cookie_file) and are_cookies_valid(cookie_file):
+				return True
+		print("[Auto Login] Failed after 3 attempts. Falling back to manual.")
+		while True:
+			if manual_login_and_export_cookies(profile_dir, cookie_file) and are_cookies_valid(cookie_file):
+				return True
+			print("[WARN] Cookies still invalid. Finish login in Chrome and press ENTER again.")
+
 # --- Config I/O helpers ---
 def load_config_with_structure():
     """
@@ -312,7 +495,10 @@ def get_safety_config():
     safety_config = {}
     
     for key in SAFETY_KEYS:
-        value = config['values'].get(key, '0')
+        if key == 'SAFER_MANUAL_LOGIN':
+            value = config['values'].get(key, 'true')  # Default to true for SAFER_MANUAL_LOGIN
+        else:
+            value = config['values'].get(key, '0')
         # Normalize legacy 0 caps to -1
         if key in ['HOURLY_POST_CAP', 'DAILY_POST_CAP'] and value == '0':
             value = '-1'
@@ -458,6 +644,52 @@ def edit_daily_cap(cfg):
 		print("  Cap must be -1 or ≥ 1 (0 invalid).")
 		return edit_daily_cap(cfg)
 	cfg['DAILY_POST_CAP'] = str(dy_new)
+	return True
+
+def edit_safer_manual_login(cfg):
+	print("\nSAFER_MANUAL_LOGIN setting. 'b' = back.")
+	current = cfg.get('SAFER_MANUAL_LOGIN', 'true').lower()
+	print(f"  Current: {current}")
+	print("  Options: true/false, on/off, 1/0, yes/no, y/n")
+	
+	while True:
+		choice = input("  New value (true/false): ").strip().lower()
+		if choice == 'b':
+			return False
+		if choice in ('true', '1', 'yes', 'y', 'on'):
+			cfg['SAFER_MANUAL_LOGIN'] = 'true'
+			return True
+		elif choice in ('false', '0', 'no', 'n', 'off'):
+			cfg['SAFER_MANUAL_LOGIN'] = 'false'
+			return True
+		else:
+			print("  Invalid choice. Please enter true/false, on/off, 1/0, yes/no, or y/n.")
+
+def edit_profile_dir(cfg):
+	print("\nPROFILE_DIR setting (Chrome profile directory). 'b' = back.")
+	current = cfg.get('PROFILE_DIR', '')
+	print(f"  Current: {current if current else '(default: <repo>/profiles/active)'}")
+	print("  Enter full path (e.g., C:\\Users\\you\\ig_profile) or leave blank for default")
+	
+	choice = input("  New value: ").strip()
+	if choice == 'b':
+		return False
+	
+	if choice:
+		# Normalize the path
+		normalized = normalize_profile_dir(choice)
+		cfg['PROFILE_DIR'] = choice  # Keep original user input
+		
+		# Try to create directory
+		try:
+			os.makedirs(normalized, exist_ok=True)
+			print(f"  Profile directory: {normalized}")
+		except Exception as e:
+			print(f"  Warning: Could not create directory {normalized}: {e}")
+	else:
+		cfg['PROFILE_DIR'] = ''
+		print("  Using default profile directory")
+	
 	return True
 
 def validate_safety_config(config):
@@ -880,12 +1112,16 @@ def get_profile_post_urls(username):
         # Dictionary to store URLs and their captions
         post_data = {}
         
+        # Get profile directory from config
+        config = read_config()
+        profile_dir, _ = resolve_profile_and_cookie(config)
+        
         # Set up Chrome options
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_argument("--start-maximized")
-        options.add_argument(f"user-data-dir={os.path.abspath('chrome-profile')}")
+        options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")
         
@@ -1217,68 +1453,7 @@ def read_config():
                 config[key.strip()] = value.strip()
     return config
 
-def verify_login_selenium_and_save_cookies(username, password):
-    print('Attempting to login with Selenium and save cookies...')
-    options = Options()
-    # Non-headless for reliability (like dm_downloader)
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.get('https://www.instagram.com/accounts/login/')
-        time.sleep(2)
-        username_field = driver.find_element('name', 'username')
-        username_field.clear()
-        username_field.send_keys(username)
-        password_field = driver.find_element('name', 'password')
-        password_field.clear()
-        password_field.send_keys(password)
-        password_field.submit()
-        time.sleep(4)
-        if 'login' not in driver.current_url.lower():
-            print('Login successful, saving cookies!')
-            save_cookies_netscape(driver, COOKIE_FILE)
-            driver.quit()
-            return True
-        page_source = driver.page_source
-        if 'The username you entered doesn\'t belong to an account' in page_source or 'Sorry, your password was incorrect' in page_source:
-            print('Login failed: incorrect username or password.')
-            driver.quit()
-            return False
-        print('Login failed: still on login page.')
-        driver.quit()
-        return False
-    except Exception as e:
-        print(f"[Login Error] Exception during Selenium login: {e}")
-        return False
 
-def prompt_for_credentials(config):
-    config_username = config.get('USERNAME')
-    config_password = config.get('PASSWORD')
-    username = config_username
-    password = config_password
-    if not username and password:
-        password = None
-    while True:
-        if not username:
-            username = input('Enter Instagram username: ').strip()
-        if not password:
-            password = getpass.getpass('Enter Instagram password: ')
-        # print(f"[DEBUG] Username entered: {repr(username)}")
-        # print(f"[DEBUG] Password entered: {repr(password)}")
-        if verify_login_selenium_and_save_cookies(username, password):
-            return username, password
-        else:
-            print('Login failed. Restart script if confident on credentials.')
-            if config_username:
-                # Only prompt for password again if username was from config.txt
-                password = getpass.getpass('Enter Instagram password: ')
-            else:
-                username = input('Enter Instagram username: ').strip()
-                password = getpass.getpass('Enter Instagram password: ')
 
 def get_profile_dumps_dir():
     config = read_config()
@@ -1352,6 +1527,9 @@ def view_safety_settings():
     day_cap = config['DAILY_POST_CAP']
     print(f"HOURLY_POST_CAP: {hour_cap if hour_cap != '-1' else 'No cap'}")
     print(f"DAILY_POST_CAP: {day_cap if day_cap != '-1' else 'No cap'}")
+    
+    safer_login = config.get('SAFER_MANUAL_LOGIN', 'true')
+    print(f"SAFER_MANUAL_LOGIN: {safer_login}")
 
 def apply_safety_preset():
     """Apply a safety preset"""
@@ -1410,6 +1588,10 @@ def edit_safety_values():
     if not edit_daily_cap(pending):
         return
     
+    # Stage 5: Manual login setting (independent)
+    if not edit_safer_manual_login(pending):
+        return
+    
     # Show summary of changes
     changes = {}
     for key in SAFETY_KEYS:
@@ -1465,19 +1647,10 @@ def main():
     conn = init_db(db_path)
     
     try:
-        # --- Cookie check: only login if cookies are missing/invalid ---
-        first_check = True
-        while not are_cookies_valid():
-            if first_check:
-                print("No valid cookies found. Login required.")
-                first_check = False
-            username, password = prompt_for_credentials(config)
-            # After this, cookies will be saved if login is successful
-            # Double-check cookies after login, loop if still invalid
-            if not are_cookies_valid():
-                print("[ERROR] Login failed or cookies could not be saved/validated. Please try again or Ctrl+C to quit.")
-        if first_check:
-            print("Valid Instagram cookies found. Skipping login.")
+        # --- New cookie gate with manual/automated login flow ---
+        if not ensure_valid_cookies(config):
+            print("[FATAL] Could not obtain valid cookies.")
+            return
         
         # Initialize SafetyPacer
         safety_config = get_safety_config()
