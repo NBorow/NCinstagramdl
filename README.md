@@ -41,9 +41,18 @@ SAFER_MANUAL_LOGIN=true
 # If you set SAFER_MANUAL_LOGIN=false, you may optionally supply credentials:
 # USERNAME=your_instagram_username
 # PASSWORD=your_instagram_password
+
+# Auto-retry when Instagram rate-limits you (HTTP 429 / "Please wait a few minutes")
+AUTO_RETRY_ON_RATE_LIMIT=true
 ```
 
-### Login and Cookies
+#
+
+#### Completely manual cookie import (optional)
+Already logged in on your normal browser? Export **web cookies** for `instagram.com` in **Netscape format** (via a cookie exporter extension) and place the file where the app expects it (e.g., `./cookies/insta_cookies.txt`). This avoids re-auth in Selenium and often reduces checkpoints. Keep it **per-account** and treat the file like a password.
+
+**Which cookies matter?** Must-haves: `sessionid`, `ds_user_id`, `csrftoken`. Nice-to-haves: `mid`, `ig_did`, `rur`, `shbid`, `shbts`, `ig_nrcb`.
+## Login and Cookies
 - **Manual (default)**  
   - The app opens Chrome with your `PROFILE_DIR` (a real, persistent user data dir).  
   - You log in by hand (and complete any 2FA/checkpoints).  
@@ -100,11 +109,18 @@ python ncinstagramdl.py
 - Human-like per-request delays, periodic long breaks, and backoff on errors.  
 - On Windows, you can press Enter to skip a long break if a prompt indicates it.
 
-## Troubleshooting
-- **Login stuck/challenge**: use manual mode (`SAFER_MANUAL_LOGIN=true`), ensure `PROFILE_DIR` points to a writable, persistent folder. Log in once, then re-run.  
-- **Switching accounts (single-profile mode)**: log out inside Chrome, log in as the new account, export cookies again. If you want a clean slate, move/clear `PROFILE_DIR`.  
-- **Driver issues**: make sure Chrome is installed; `webdriver-manager` will fetch a matching driver.  
-- **Rate limits**: the script slows down automatically; consider safer presets if you hit blocks.
+
+### Blocking & Recovery
+- **RateLimitError** (HTTP 429, “Please wait a few minutes”, “Temporarily blocked”):
+  If `AUTO_RETRY_ON_RATE_LIMIT=true`, the app auto-retries the **same item** using a fixed schedule:
+  **75s → 150s → 300s → 600s → 1200s → 2400s → 4800s (cap)**.
+  If set to `false`, you’ll get an interactive prompt to retry/skip/quit. Waiting works best; skipping rarely helps.
+
+- **LoginRequiredError** (“login required”, “not logged in”):
+  Cookies/session are invalid or expired. Use **manual login now** (persistent Chrome profile) or refresh your cookies, then retry.
+
+- **CheckpointError** (“verify it’s you”, `challenge_required`):
+  Complete manual verification in the persistent profile, then **wait ~30–60 minutes** before resuming, or switch accounts/profiles. Prompt offers: retry / manual-login-now / skip / quit.
 
 ## Notes
 - Respect Instagram’s Terms and local laws.  
