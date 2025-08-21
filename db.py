@@ -35,7 +35,8 @@ def init_db(db_path: str) -> sqlite3.Connection:
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             status TEXT DEFAULT 'success', -- 'success', 'failed', 'skipped'
             error_message TEXT,
-            dm_thread TEXT
+            dm_thread TEXT,
+            local_path TEXT                -- NEW
         )
     ''')
     
@@ -98,106 +99,111 @@ def get_post(conn: sqlite3.Connection, shortcode: str) -> Optional[Dict]:
     return None
 
 
-def record_download(conn: sqlite3.Connection, post: Dict) -> str:
-	"""
-	Record a successful download in the database.
-	
-	Args:
-		conn: Database connection
-		post: Dictionary containing post information with keys:
-		      shortcode, url, description, original_owner, share_text,
-		      source, username, timestamp_ms, status (optional)
-		      
-	Returns:
-		str: "inserted", "duplicate", or "error"
-	"""
-	try:
-		conn.execute('''
-			INSERT INTO posts (
-				shortcode, url, description, original_owner, share_text,
-				source, username, timestamp_ms, status, downloaded_at,
-				error_message, dm_thread
-			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?)
-			ON CONFLICT(shortcode) DO UPDATE SET
-				status='success',
-				error_message=NULL,
-				downloaded_at=CURRENT_TIMESTAMP,
-				url=excluded.url,
-				description=excluded.description,
-				original_owner=excluded.original_owner,
-				share_text=excluded.share_text,
-				source=excluded.source,
-				username=excluded.username,
-				timestamp_ms=excluded.timestamp_ms,
-				dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread)
-		''', (
-			post.get('shortcode'),
-			post.get('url'),
-			post.get('description'),
-			post.get('original_owner'),
-			post.get('share_text'),
-			post.get('source'),
-			post.get('username'),
-			post.get('timestamp_ms'),
-			post.get('dm_thread'),
-		))
-		conn.commit()
-		return "inserted"
-	except Exception as e:
-		print(f"Database error recording download: {e}")
-		return "error"
+def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[str] = None) -> str:
+    """
+    Record a successful download in the database.
+    
+    Args:
+        conn: Database connection
+        post: Dictionary containing post information with keys:
+              shortcode, url, description, original_owner, share_text,
+              source, username, timestamp_ms, status (optional)
+        local_path: Optional path to the downloaded file
+              
+    Returns:
+        str: "inserted", "duplicate", or "error"
+    """
+    try:
+        conn.execute('''
+            INSERT INTO posts (
+                shortcode, url, description, original_owner, share_text,
+                source, username, timestamp_ms, status, downloaded_at,
+                error_message, dm_thread, local_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
+            ON CONFLICT(shortcode) DO UPDATE SET
+                status='success',
+                error_message=NULL,
+                downloaded_at=CURRENT_TIMESTAMP,
+                url=excluded.url,
+                description=excluded.description,
+                original_owner=excluded.original_owner,
+                share_text=excluded.share_text,
+                source=excluded.source,
+                username=excluded.username,
+                timestamp_ms=excluded.timestamp_ms,
+                dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread),
+                local_path=COALESCE(excluded.local_path, posts.local_path)
+        ''', (
+            post.get('shortcode'),
+            post.get('url'),
+            post.get('description'),
+            post.get('original_owner'),
+            post.get('share_text'),
+            post.get('source'),
+            post.get('username'),
+            post.get('timestamp_ms'),
+            post.get('dm_thread'),
+            local_path
+        ))
+        conn.commit()
+        return "inserted"
+    except Exception as e:
+        print(f"Database error recording download: {e}")
+        return "error"
 
 
 def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
-	"""
-	Record a failed download attempt in the database.
-	
-	Args:
-		conn: Database connection
-		post: Dictionary containing post information
-		error: Error message describing the failure
-		
-	Returns:
-		str: "inserted", "duplicate", or "error"
-	"""
-	try:
-		conn.execute('''
-			INSERT INTO posts (
-				shortcode, url, description, original_owner, share_text,
-				source, username, timestamp_ms, status, error_message,
-				downloaded_at, dm_thread
-			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?)
-			ON CONFLICT(shortcode) DO UPDATE SET
-				status='failed',
-				error_message=excluded.error_message,
-				downloaded_at=CURRENT_TIMESTAMP,
-				url=COALESCE(excluded.url, posts.url),
-				description=COALESCE(excluded.description, posts.description),
-				original_owner=COALESCE(excluded.original_owner, posts.original_owner),
-				share_text=COALESCE(excluded.share_text, posts.share_text),
-				source=COALESCE(excluded.source, posts.source),
-				username=COALESCE(excluded.username, posts.username),
-				timestamp_ms=COALESCE(excluded.timestamp_ms, posts.timestamp_ms),
-				dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread)
-		''', (
-			post.get('shortcode'),
-			post.get('url'),
-			post.get('description'),
-			post.get('original_owner'),
-			post.get('share_text'),
-			post.get('source'),
-			post.get('username'),
-			post.get('timestamp_ms'),
-			error,
-			post.get('dm_thread'),
-		))
-		conn.commit()
-		return "inserted"
-	except Exception as e:
-		print(f"Database error recording failure: {e}")
-		return "error"
+    """
+    Record a failed download attempt in the database.
+    
+    Args:
+        conn: Database connection
+        post: Dictionary containing post information
+        error: Error message describing the failure
+        
+    Returns:
+        str: "inserted", "duplicate", or "error"
+    """
+    try:
+        conn.execute('''
+            INSERT INTO posts (
+                shortcode, url, description, original_owner, share_text,
+                source, username, timestamp_ms, status, error_message,
+                downloaded_at, dm_thread, local_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?, NULL)
+            ON CONFLICT(shortcode) DO UPDATE SET
+                status='failed',
+                error_message=excluded.error_message,
+                downloaded_at=CURRENT_TIMESTAMP,
+                url=COALESCE(excluded.url, posts.url),
+                description=COALESCE(excluded.description, posts.description),
+                original_owner=COALESCE(excluded.original_owner, posts.original_owner),
+                share_text=COALESCE(excluded.share_text, posts.share_text),
+                source=COALESCE(excluded.source, posts.source),
+                username=COALESCE(excluded.username, posts.username),
+                timestamp_ms=COALESCE(excluded.timestamp_ms, posts.timestamp_ms),
+                dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread),
+                local_path=COALESCE(excluded.local_path, posts.local_path)
+        ''', (
+            post.get('shortcode'),
+            post.get('url'),
+            post.get('description'),
+            post.get('original_owner'),
+            post.get('share_text'),
+            post.get('source'),
+            post.get('username'),
+            post.get('timestamp_ms'),
+            error,
+            post.get('dm_thread'),
+        ))
+        
+        conn.commit()
+        return "inserted"
+    except Exception as e:
+        print(f"Database error recording failure: {e}")
+        return "error"
 
 
 def get_download_stats(conn: sqlite3.Connection) -> Dict[str, int]:
