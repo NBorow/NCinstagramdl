@@ -22,6 +22,32 @@ import requests
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
+# --- Exception classes for recoverable errors ---
+class RateLimitError(Exception): pass
+class CheckpointError(Exception): pass
+class LoginRequiredError(Exception): pass
+
+# --- Rate limit configuration ---
+RATE_LIMIT_SCHEDULE = [75, 150, 300, 600, 1200, 2400, 4800]  # seconds
+
+def parse_bool(s: str, default: bool) -> bool:
+	if s is None: return default
+	return s.strip().lower() in ("1","true","yes","y","on")
+
+
+
+def classify_block_reason(stderr: str):
+    if not stderr:
+        return None
+    s = stderr.lower()
+    if any(p in s for p in ["checkpoint", "challenge_required", "verify it's you", "verify its you"]):
+        return "checkpoint"
+    if any(p in s for p in ["login required", "please log in", "not logged in"]):
+        return "login_required"
+    if any(p in s for p in ["429", "rate limit", "please wait", "try again later", "temporarily blocked"]):
+        return "rate_limit"
+    return None
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
 PAGE_SIZE = 10
@@ -47,10 +73,6 @@ def build_chrome_options(profile_dir: str, window_size: str = "1280,900") -> Opt
     return opts
 
 # --- Config parsing helpers for manual login ---
-def parse_bool(s: str, default: bool) -> bool:
-	if s is None: return default
-	return s.strip().lower() in ("1","true","yes","y","on")
-
 def normalize_profile_dir(raw: str) -> str:
 	script_dir = os.path.dirname(__file__)
 	if not raw or not raw.strip():
@@ -81,7 +103,8 @@ SAFETY_KEYS = [
     'LONG_BREAK_MAX_SECONDS',
     'HOURLY_POST_CAP',
     'DAILY_POST_CAP',
-    'SAFER_MANUAL_LOGIN'
+    'SAFER_MANUAL_LOGIN',
+    'AUTO_RETRY_ON_RATE_LIMIT'
 ]
 
 SAFETY_PRESETS = {
@@ -93,7 +116,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MAX_SECONDS': '400',
         'HOURLY_POST_CAP': '30',
         'DAILY_POST_CAP': '550',
-        'SAFER_MANUAL_LOGIN': 'true'
+        'SAFER_MANUAL_LOGIN': 'true',
+        'AUTO_RETRY_ON_RATE_LIMIT': 'false'
     },
     'super_safe': {
         'MIN_DELAY_SECONDS': '20',
@@ -103,7 +127,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MAX_SECONDS': '300',
         'HOURLY_POST_CAP': '80',
         'DAILY_POST_CAP': '600',
-        'SAFER_MANUAL_LOGIN': 'true'
+        'SAFER_MANUAL_LOGIN': 'true',
+        'AUTO_RETRY_ON_RATE_LIMIT': 'false'
     },
     'standard': {
         'MIN_DELAY_SECONDS': '6',
@@ -113,7 +138,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MAX_SECONDS': '180',
         'HOURLY_POST_CAP': '200',
         'DAILY_POST_CAP': '1500',
-        'SAFER_MANUAL_LOGIN': 'false'
+        'SAFER_MANUAL_LOGIN': 'false',
+        'AUTO_RETRY_ON_RATE_LIMIT': 'true'
     },
     'risky': {
         'MIN_DELAY_SECONDS': '2',
@@ -123,7 +149,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MAX_SECONDS': '120',
         'HOURLY_POST_CAP': '400',
         'DAILY_POST_CAP': '3000',
-        'SAFER_MANUAL_LOGIN': 'false'
+        'SAFER_MANUAL_LOGIN': 'false',
+        'AUTO_RETRY_ON_RATE_LIMIT': 'true'
     },
     'max_risk': {
         'MIN_DELAY_SECONDS': '0',
@@ -133,7 +160,8 @@ SAFETY_PRESETS = {
         'LONG_BREAK_MAX_SECONDS': '0',
         'HOURLY_POST_CAP': '-1',
         'DAILY_POST_CAP': '-1',
-        'SAFER_MANUAL_LOGIN': 'false'
+        'SAFER_MANUAL_LOGIN': 'false',
+        'AUTO_RETRY_ON_RATE_LIMIT': 'true'
     }
 }
 
@@ -483,6 +511,8 @@ def get_safety_config():
     for key in SAFETY_KEYS:
         if key == 'SAFER_MANUAL_LOGIN':
             value = config['values'].get(key, 'true')  # Default to true for SAFER_MANUAL_LOGIN
+        elif key == 'AUTO_RETRY_ON_RATE_LIMIT':
+            value = config['values'].get(key, 'true')  # Default to true for AUTO_RETRY_ON_RATE_LIMIT
         else:
             value = config['values'].get(key, '0')
         # Normalize legacy 0 caps to -1
@@ -637,16 +667,41 @@ def edit_safer_manual_login(cfg):
 	current = cfg.get('SAFER_MANUAL_LOGIN', 'true').lower()
 	print(f"  Current: {current}")
 	print("  Options: true/false, on/off, 1/0, yes/no, y/n")
+	print("  Press Enter to keep current value")
 	
 	while True:
 		choice = input("  New value (true/false): ").strip().lower()
 		if choice == 'b':
 			return False
+		if choice == '':
+			return True  # Keep current value
 		if choice in ('true', '1', 'yes', 'y', 'on'):
 			cfg['SAFER_MANUAL_LOGIN'] = 'true'
 			return True
 		elif choice in ('false', '0', 'no', 'n', 'off'):
 			cfg['SAFER_MANUAL_LOGIN'] = 'false'
+			return True
+		else:
+			print("  Invalid choice. Please enter true/false, on/off, 1/0, yes/no, or y/n.")
+
+def edit_auto_retry_on_rate_limit(cfg):
+	print("\nAUTO_RETRY_ON_RATE_LIMIT setting. 'b' = back.")
+	current = cfg.get('AUTO_RETRY_ON_RATE_LIMIT', 'true').lower()
+	print(f"  Current: {current}")
+	print("  Options: true/false, on/off, 1/0, yes/no, y/n")
+	print("  Press Enter to keep current value")
+	
+	while True:
+		choice = input("  New value (true/false): ").strip().lower()
+		if choice == 'b':
+			return False
+		if choice == '':
+			return True  # Keep current value
+		if choice in ('true', '1', 'yes', 'y', 'on'):
+			cfg['AUTO_RETRY_ON_RATE_LIMIT'] = 'true'
+			return True
+		elif choice in ('false', '0', 'no', 'n', 'off'):
+			cfg['AUTO_RETRY_ON_RATE_LIMIT'] = 'false'
 			return True
 		else:
 			print("  Invalid choice. Please enter true/false, on/off, 1/0, yes/no, or y/n.")
@@ -718,31 +773,7 @@ def validate_safety_config(config):
     except ValueError as e:
         return False, f"Invalid numeric value: {e}"
 
-def check_rate_limit_error(stderr):
-    """
-    Check if stderr contains rate limit or checkpoint patterns.
-    
-    Args:
-        stderr: Error output from yt-dlp or gallery-dl
-        
-    Returns:
-        bool: True if rate limit detected
-    """
-    if not stderr:
-        return False
-    
-    patterns = [
-        '429',
-        'please wait',
-        'rate limit',
-        'checkpoint',
-        'try again later',
-        'login required',
-        'temporarily blocked'
-    ]
-    
-    stderr_lower = stderr.lower()
-    return any(pattern in stderr_lower for pattern in patterns)
+
 
 def sanitize_filename(filename):
     """
@@ -949,9 +980,14 @@ def download_post(conn, post_data, download_dir, pacer=None):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         # Check for rate limit errors
-        if result.returncode != 0 and check_rate_limit_error(result.stderr):
-            print("[SAFE] Rate limit or checkpoint detected. Halting for manual review.")
-            exit(1)
+        if result.returncode != 0:
+            reason = classify_block_reason(result.stderr)
+            if reason == "rate_limit":
+                raise RateLimitError(result.stderr or "rate limited")
+            elif reason == "checkpoint":
+                raise CheckpointError(result.stderr or "checkpoint")
+            elif reason == "login_required":
+                raise LoginRequiredError(result.stderr or "login required")
         
         if result.returncode == 0:
             print(f"Successfully downloaded {shortcode}")
@@ -998,9 +1034,14 @@ def download_post(conn, post_data, download_dir, pacer=None):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         # Check for rate limit errors
-        if result.returncode != 0 and check_rate_limit_error(result.stderr):
-            print("[SAFE] Rate limit or checkpoint detected. Halting for manual review.")
-            exit(1)
+        if result.returncode != 0:
+            reason = classify_block_reason(result.stderr)
+            if reason == "rate_limit":
+                raise RateLimitError(result.stderr or "rate limited")
+            elif reason == "checkpoint":
+                raise CheckpointError(result.stderr or "checkpoint")
+            elif reason == "login_required":
+                raise LoginRequiredError(result.stderr or "login required")
         
         if result.returncode == 0:
             print(f"Successfully downloaded {shortcode} with gallery-dl")
@@ -1218,7 +1259,7 @@ def get_profile_post_urls(username):
         print(f"[ERROR] Error using Selenium for @{username}: {e}")
         return [], {}
 
-def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None):
+def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None, safety_config=None):
     """
     Download all posts from a user's profile using Selenium scraping.
     
@@ -1289,12 +1330,70 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 'dm_thread': thread_name
             }
             
-            # Use our existing download method
-            if download_post(conn, post_data_dict, profile_dir, pacer):
-                successful_downloads += 1
-                print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
-            else:
-                print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
+            # Use our existing download method with exception handling
+            retry_count = 0
+            while True:
+                try:
+                    ok = download_post(conn, post_data_dict, profile_dir, pacer)
+                    # success or non-block failure -> break to next item
+                    if ok:
+                        successful_downloads += 1
+                        print(f"[SUCCESS] Downloaded post {i}/{len(post_urls)} for @{username}")
+                    else:
+                        print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
+                    break
+                except RateLimitError as e:
+                    auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
+                    if auto_retry:
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"\n[BLOCK] Rate limited. Auto-retrying this item in {delay}s...")
+                        time.sleep(delay)
+                        retry_count += 1
+                        continue
+                    else:
+                        resp = input("[Enter]=retry now  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                        if resp == "q":
+                            return False
+                        if resp == "s":
+                            record_failure(conn, post_data_dict, "Skipped after rate limit")
+                            break
+                        # else retry immediately
+                except CheckpointError as e:
+                    print(f"\n[BLOCK] Checkpoint/challenge.")
+                    print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
+                    resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post_data_dict, "Skipped during checkpoint")
+                        break
+                    if resp == "m":
+                        # Get current profile and cookie file
+                        config = read_config()
+                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                        if manual_login_and_export_cookies(profile_dir, cookie_file):
+                            print("[BLOCK] Manual login completed, retrying...")
+                        else:
+                            print("[BLOCK] Manual login failed, retrying anyway...")
+                        # else retry immediately
+                except LoginRequiredError as e:
+                    print(f"\n[BLOCK] Login required (cookies/session invalid).")
+                    print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
+                    resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post_data_dict, "Skipped after login-required")
+                        break
+                    if resp == "m":
+                        # Get current profile and cookie file
+                        config = read_config()
+                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                        if manual_login_and_export_cookies(profile_dir, cookie_file):
+                            print("[BLOCK] Manual login completed, retrying...")
+                        else:
+                            print("[BLOCK] Manual login failed, retrying anyway...")
+                    # else retry immediately
             
 
         
@@ -1309,7 +1408,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         print(f"[ERROR] Profile @{username} - {e}")
         return False
 
-def process_dm_download(conn, selected_path, pacer=None):
+def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
     """
     Process DM downloads from a selected profile dump.
     
@@ -1405,7 +1504,7 @@ def process_dm_download(conn, selected_path, pacer=None):
                 
                 for profile in profiles:
                     username = profile['username']
-                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name)
+                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name, safety_config)
                     total_profiles += 1
             else:
                 print("Skipping profile downloads as requested.")
@@ -1413,8 +1512,68 @@ def process_dm_download(conn, selected_path, pacer=None):
         # Download shared posts
         for i, post in enumerate(posts, 1):
             print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
-            if download_post(conn, post, dm_download_dir, pacer):
-                total_posts += 1
+            
+            # Use our existing download method with exception handling
+            retry_count = 0
+            while True:
+                try:
+                    ok = download_post(conn, post, dm_download_dir, pacer)
+                    # success or non-block failure -> break to next item
+                    if ok:
+                        total_posts += 1
+                    break
+                except RateLimitError as e:
+                    auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
+                    if auto_retry:
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"\n[BLOCK] Rate limited. Auto-retrying this item in {delay}s...")
+                        time.sleep(delay)
+                        retry_count += 1
+                        continue
+                    else:
+                        resp = input("[Enter]=retry now  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                        if resp == "q":
+                            return False
+                        if resp == "s":
+                            record_failure(conn, post, "Skipped after rate limit")
+                            break
+                        # else retry immediately
+                except CheckpointError as e:
+                    print(f"\n[BLOCK] Checkpoint/challenge.")
+                    print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
+                    resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post, "Skipped during checkpoint")
+                        break
+                    if resp == "m":
+                        # Get current profile and cookie file
+                        config = read_config()
+                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                        if manual_login_and_export_cookies(profile_dir, cookie_file):
+                            print("[BLOCK] Manual login completed, retrying...")
+                        else:
+                            print("[BLOCK] Manual login failed, retrying anyway...")
+                        # else retry immediately
+                except LoginRequiredError as e:
+                    print(f"\n[BLOCK] Login required (cookies/session invalid).")
+                    print("[Advice] Revalidate cookies via MANUAL LOGIN, then retry.")
+                    resp = input("[M]=manual login now  |  R=retry with current cookies  |  S=skip  |  Q=quit > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post, "Skipped after login-required")
+                        break
+                    if resp == "m":
+                        # Get current profile and cookie file
+                        config = read_config()
+                        profile_dir, cookie_file = resolve_profile_and_cookie(config)
+                        if manual_login_and_export_cookies(profile_dir, cookie_file):
+                            print("[BLOCK] Manual login completed, retrying...")
+                        else:
+                            print("[BLOCK] Manual login failed, retrying anyway...")
+                    # else retry immediately
     
     print(f"\nDM download complete!")
     print(f"Total posts downloaded: {total_posts}")
@@ -1514,6 +1673,9 @@ def view_safety_settings():
     
     safer_login = config.get('SAFER_MANUAL_LOGIN', 'true')
     print(f"SAFER_MANUAL_LOGIN: {safer_login}")
+    
+    auto_retry = config.get('AUTO_RETRY_ON_RATE_LIMIT', 'true')
+    print(f"AUTO_RETRY_ON_RATE_LIMIT: {auto_retry}")
 
 def apply_safety_preset():
     """Apply a safety preset"""
@@ -1574,6 +1736,10 @@ def edit_safety_values():
     
     # Stage 5: Manual login setting (independent)
     if not edit_safer_manual_login(pending):
+        return
+    
+    # Stage 6: Auto retry rate limit setting (independent)
+    if not edit_auto_retry_on_rate_limit(pending):
         return
     
     # Show summary of changes
@@ -1694,7 +1860,7 @@ def main():
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
-                                    result = process_dm_download(conn, selected_path, pacer)
+                                    result = process_dm_download(conn, selected_path, pacer, safety_config)
                                     if result is True:
                                         # Print download statistics only if completed
                                         print("\nDownload Statistics:")
