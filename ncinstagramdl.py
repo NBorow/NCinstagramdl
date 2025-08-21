@@ -792,6 +792,23 @@ def sanitize_filename(filename):
     filename = filename.strip()
     return filename
 
+def to_file_uri(path: str) -> str:
+	p = os.path.abspath(path)
+	if os.name == 'nt':
+		# file:///C:/...
+		return 'file:///' + p.replace('\\', '/')
+	return 'file://' + p
+
+def is_abs_pathish(s: str) -> bool:
+	s = s.strip()
+	if not s:
+		return False
+	# Windows C:\ or \\server\share
+	if os.name == 'nt':
+		return bool(re.match(r'^[a-zA-Z]:\\', s)) or s.startswith('\\\\')
+	# POSIX
+	return s.startswith('/')
+
 def generate_filename(post_data, max_length=200):
     """
     Generate structured filename for downloaded posts.
@@ -932,162 +949,176 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     return posts, profiles
 
 def download_post(conn, post_data, download_dir, pacer=None):
-    """
-    Download a single Instagram post using yt-dlp with fallback to gallery-dl.
+	"""
+	Download a single Instagram post using yt-dlp with fallback to gallery-dl.
+	
+	Args:
+		conn: Database connection
+		post_data: Dictionary containing post information
+		download_dir: Directory to save the download
+		pacer: SafetyPacer instance for rate limiting
+		
+	Returns:
+		bool: True if download successful, False otherwise
+	"""
+	shortcode = post_data.get('shortcode')
+	url = post_data.get('url')
+	
+	if not shortcode or not url:
+		print(f"Missing shortcode or URL for post")
+		return False
+	
+	# Check if already downloaded
+	if is_downloaded(conn, shortcode):
+		print(f"[SKIPPED] {shortcode} already recorded")
+		return True
+	
+	# Safety pacing before download
+	if pacer:
+		pacer.before_download()
     
-    Args:
-        conn: Database connection
-        post_data: Dictionary containing post information
-        download_dir: Directory to save the download
-        pacer: SafetyPacer instance for rate limiting
-        
-    Returns:
-        bool: True if download successful, False otherwise
-    """
-    shortcode = post_data.get('shortcode')
-    url = post_data.get('url')
+	# Generate filename
+	filename_template = generate_filename(post_data)
+	output_path = os.path.join(download_dir, filename_template)
+	
+	print(f"Downloading {shortcode}...")
+	
+	# Try yt-dlp first
+	try:
+		cmd = [
+			'yt-dlp',
+			'--cookies', COOKIE_FILE,
+			'--output', output_path,
+			'--no-check-certificate',
+			'--ignore-errors',
+			'--print', 'after_move:filepath',   # NEW: print final saved file path
+			url
+		]
+		
+		result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+		
+		# Check for rate limit errors
+		if result.returncode != 0:
+			reason = classify_block_reason(result.stderr)
+			if reason == "rate_limit":
+				raise RateLimitError(result.stderr or "rate limited")
+			elif reason == "checkpoint":
+				raise CheckpointError(result.stderr or "checkpoint")
+			elif reason == "login_required":
+				raise LoginRequiredError(result.stderr or "login required")
+		
+		if result.returncode == 0:
+			# extract final path from stdout (last non-empty line)
+			std_lines = [l for l in result.stdout.splitlines() if l.strip()]
+			saved_path = std_lines[-1].strip() if std_lines else None
+			if saved_path and not os.path.isabs(saved_path):
+				saved_path = os.path.abspath(os.path.join(download_dir, saved_path))
+			status = record_download(conn, post_data, saved_path)   # pass path
+			if status == "inserted":
+				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
+				print(f"Successfully downloaded and recorded {fname}")
+				if saved_path:
+					print(f"[LINK]  {to_file_uri(saved_path)}")
+				if pacer:
+					pacer.after_success()
+			elif status == "duplicate":
+				print(f"[DUPLICATE] {shortcode} already in database")
+			else:
+				print(f"[ERROR] {shortcode} → database error")
+			return True
+		else:
+			print(f"yt-dlp failed for {shortcode}: {result.stderr}")
+			
+	except subprocess.TimeoutExpired:
+		print(f"yt-dlp timeout for {shortcode}")
+	except Exception as e:
+		print(f"yt-dlp error for {shortcode}: {e}")
     
-    if not shortcode or not url:
-        print(f"Missing shortcode or URL for post")
-        return False
-    
-    # Check if already downloaded
-    if is_downloaded(conn, shortcode):
-        print(f"[SKIPPED] {shortcode} already recorded")
-        return True
-    
-    # Safety pacing before download
-    if pacer:
-        pacer.before_download()
-    
-    # Generate filename
-    filename_template = generate_filename(post_data)
-    output_path = os.path.join(download_dir, filename_template)
-    
-    print(f"Downloading {shortcode}...")
-    
-    # Try yt-dlp first
-    try:
-        cmd = [
-            'yt-dlp',
-            '--cookies', COOKIE_FILE,
-            '--output', output_path,
-            '--no-check-certificate',
-            '--ignore-errors',
-            url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        # Check for rate limit errors
-        if result.returncode != 0:
-            reason = classify_block_reason(result.stderr)
-            if reason == "rate_limit":
-                raise RateLimitError(result.stderr or "rate limited")
-            elif reason == "checkpoint":
-                raise CheckpointError(result.stderr or "checkpoint")
-            elif reason == "login_required":
-                raise LoginRequiredError(result.stderr or "login required")
-        
-        if result.returncode == 0:
-            print(f"Successfully downloaded {shortcode}")
-            status = record_download(conn, post_data)
-            if status == "inserted":
-                print(f"[RECORDED] {shortcode} successfully")
-                # Safety pacing after success
-                if pacer:
-                    pacer.after_success()
-            elif status == "duplicate":
-                print(f"[DUPLICATE] {shortcode} already in database")
-            else:
-                print(f"[ERROR] {shortcode} → database error")
-            return True
-        else:
-            print(f"yt-dlp failed for {shortcode}: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        print(f"yt-dlp timeout for {shortcode}")
-    except Exception as e:
-        print(f"yt-dlp error for {shortcode}: {e}")
-    
-    # Fallback to gallery-dl
-    try:
-        # Create gallery-dl specific filename template with proper extension handling
-        # gallery-dl uses {extension} instead of %(ext)s
-        # For carousels, we want: shortcode/shortcode_{num}.{extension} (creates folder)
-        # For single posts, we want: shortcode.{extension} (no folder)
-        base_filename = filename_template.replace('.%(ext)s', '')
-        
-        # Use the actual shortcode for folder creation
-        # This should create a folder named after the post for carousels
-        shortcode = post_data.get('shortcode', 'unknown')
-        gallery_filename = f'{shortcode}/{{shortcode}}_{{num}}.{{extension}}'
+	# Fallback to gallery-dl
+	try:
+		# Create gallery-dl specific filename template with proper extension handling
+		# gallery-dl uses {extension} instead of %(ext)s
+		# For carousels, we want: shortcode/shortcode_{num}.{extension} (creates folder)
+		# For single posts, we want: shortcode.{extension} (no folder)
+		base_filename = filename_template.replace('.%(ext)s', '')
+		
+		# Use the actual shortcode for folder creation
+		# This should create a folder named after the post for carousels
+		shortcode = post_data.get('shortcode', 'unknown')
+		gallery_filename = f'{shortcode}/{{shortcode}}_{{num}}.{{extension}}'
 
-        cmd = [
-            'gallery-dl',
-            '--cookies', COOKIE_FILE,
-            '--directory', download_dir,  # Force exact directory, no subfolders
-            '--filename', gallery_filename,
-            url
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        # Check for rate limit errors
-        if result.returncode != 0:
-            reason = classify_block_reason(result.stderr)
-            if reason == "rate_limit":
-                raise RateLimitError(result.stderr or "rate limited")
-            elif reason == "checkpoint":
-                raise CheckpointError(result.stderr or "checkpoint")
-            elif reason == "login_required":
-                raise LoginRequiredError(result.stderr or "login required")
-        
-        if result.returncode == 0:
-            print(f"Successfully downloaded {shortcode} with gallery-dl")
-            status = record_download(conn, post_data)
-            if status == "inserted":
-                print(f"[RECORDED] {shortcode} successfully")
-                # Safety pacing after success
-                if pacer:
-                    pacer.after_success()
-            elif status == "duplicate":
-                print(f"[DUPLICATE] {shortcode} already in database")
-            else:
-                print(f"[ERROR] {shortcode} → database error")
-            return True
-        else:
-            print(f"gallery-dl failed for {shortcode}: {result.stderr}")
-            
-    except subprocess.TimeoutExpired:
-        print(f"gallery-dl timeout for {shortcode}")
-    except Exception as e:
-        print(f"gallery-dl error for {shortcode}: {e}")
+		cmd = [
+			'gallery-dl',
+			'--cookies', COOKIE_FILE,
+			'--directory', download_dir,  # Force exact directory, no subfolders
+			'--filename', gallery_filename,
+			'--exec', 'echo {filepath}',        # NEW: print each saved file
+			url
+		]
+		
+		result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+		
+		# Check for rate limit errors
+		if result.returncode != 0:
+			reason = classify_block_reason(result.stderr)
+			if reason == "rate_limit":
+				raise RateLimitError(result.stderr or "rate limited")
+			elif reason == "checkpoint":
+				raise CheckpointError(result.stderr or "checkpoint")
+			elif reason == "login_required":
+				raise LoginRequiredError(result.stderr or "login required")
+		
+		if result.returncode == 0:
+			# pick the last absolute-looking path from stdout
+			candidates = [l.strip() for l in result.stdout.splitlines() if is_abs_pathish(l)]
+			saved_path = candidates[-1] if candidates else None
+			if saved_path and not os.path.isabs(saved_path):
+				saved_path = os.path.abspath(os.path.join(download_dir, saved_path))
+			status = record_download(conn, post_data, saved_path)   # pass path
+			if status == "inserted":
+				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
+				print(f"Successfully downloaded and recorded {fname}")
+				if saved_path:
+					print(f"[LINK]  {to_file_uri(saved_path)}")
+				if pacer:
+					pacer.after_success()
+			elif status == "duplicate":
+				print(f"[DUPLICATE] {shortcode} already in database")
+			else:
+				print(f"[ERROR] {shortcode} → database error")
+			return True
+		else:
+			print(f"gallery-dl failed for {shortcode}: {result.stderr}")
+			
+	except subprocess.TimeoutExpired:
+		print(f"gallery-dl timeout for {shortcode}")
+	except Exception as e:
+		print(f"gallery-dl error for {shortcode}: {e}")
     
-    # Record failure
-    error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
-    status = record_failure(conn, post_data, error_msg)
-    if status == "inserted":
-        print(f"[ERROR] {shortcode} → {error_msg}")
-    elif status == "duplicate":
-        print(f"[DUPLICATE] {shortcode} failure already recorded")
-    else:
-        print(f"[ERROR] {shortcode} → database error recording failure")
-    
-    # Log total failure to file for debugging
-    try:
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}\n"
-        
-        with open("total_failures.log", "a", encoding="utf-8") as f:
-            f.write(failure_log_entry)
-        
-        print(f"[DEBUG] Total failure logged to total_failures.log")
-    except Exception as e:
-        print(f"[DEBUG] Failed to log to file: {e}")
-    
-    return False
+	# Record failure
+	error_msg = f"Both yt-dlp and gallery-dl failed to download {shortcode}"
+	status = record_failure(conn, post_data, error_msg)
+	if status == "inserted":
+		print(f"[ERROR] {shortcode} → {error_msg}")
+	elif status == "duplicate":
+		print(f"[DUPLICATE] {shortcode} failure already recorded")
+	else:
+		print(f"[ERROR] {shortcode} → database error recording failure")
+	
+	# Log total failure to file for debugging
+	try:
+		from datetime import datetime
+		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}\n"
+		
+		with open("total_failures.log", "a", encoding="utf-8") as f:
+			f.write(failure_log_entry)
+		
+		print(f"[DEBUG] Total failure logged to total_failures.log")
+	except Exception as e:
+		print(f"[DEBUG] Failed to log to file: {e}")
+	
+	return False
 
 
 
