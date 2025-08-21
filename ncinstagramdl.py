@@ -1343,24 +1343,37 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
                     break
                 except RateLimitError as e:
+                    print(f"\n[BLOCK] Rate limited.")
+                    print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
                         delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"\n[BLOCK] Rate limited. Auto-retrying this item in {delay}s...")
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
                         time.sleep(delay)
                         retry_count += 1
                         continue
-                    else:
-                        resp = input("[Enter]=retry now  |  S=skip this item  |  Q=quit run > ").strip().lower()
-                        if resp == "q":
-                            return False
-                        if resp == "s":
-                            record_failure(conn, post_data_dict, "Skipped after rate limit")
-                            break
-                        # else retry immediately
+                    # interactive mode
+                    if retry_count > 0:  # delayed retry mode
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
+                        time.sleep(delay)
+                        retry_count += 1
+                        continue
+                    resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post_data_dict, "Skipped after rate limit")
+                        break
+                    if resp == "d":
+                        retry_count = 0  # start delayed retry mode at first step
+                        continue  # loop will sleep next time
+                    # default: immediate retry
+                    continue
                 except CheckpointError as e:
                     print(f"\n[BLOCK] Checkpoint/challenge.")
                     print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
+                    print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
                     resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
                     if resp == "q":
                         return False
@@ -1523,24 +1536,37 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         total_posts += 1
                     break
                 except RateLimitError as e:
+                    print(f"\n[BLOCK] Rate limited.")
+                    print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
                         delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"\n[BLOCK] Rate limited. Auto-retrying this item in {delay}s...")
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
                         time.sleep(delay)
                         retry_count += 1
                         continue
-                    else:
-                        resp = input("[Enter]=retry now  |  S=skip this item  |  Q=quit run > ").strip().lower()
-                        if resp == "q":
-                            return False
-                        if resp == "s":
-                            record_failure(conn, post, "Skipped after rate limit")
-                            break
-                        # else retry immediately
+                    # interactive mode
+                    if retry_count > 0:  # delayed retry mode
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
+                        time.sleep(delay)
+                        retry_count += 1
+                        continue
+                    resp = input("[Enter]=retry now  |  D=delayed exponential retry  |  S=skip this item  |  Q=quit run > ").strip().lower()
+                    if resp == "q":
+                        return False
+                    if resp == "s":
+                        record_failure(conn, post, "Skipped after rate limit")
+                        break
+                    if resp == "d":
+                        retry_count = 0  # start delayed retry mode at first step
+                        continue  # loop will sleep next time
+                    # default: immediate retry
+                    continue
                 except CheckpointError as e:
                     print(f"\n[BLOCK] Checkpoint/challenge.")
                     print("[Advice] Complete MANUAL LOGIN with the same persistent profile (or wait/switch), then retry.")
+                    print("[Advice] After clearing the challenge, waiting ~30–60 minutes before resuming is safest.")
                     resp = input("[Enter]=retry  |  M=manual login now  |  S=skip  |  Q=quit > ").strip().lower()
                     if resp == "q":
                         return False
