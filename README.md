@@ -43,7 +43,7 @@ SAFER_MANUAL_LOGIN=true
 # PASSWORD=your_instagram_password
 
 # Auto-retry when Instagram rate-limits you (HTTP 429 / "Please wait a few minutes")
-AUTO_RETRY_RATE_LIMIT=true
+AUTO_RETRY_ON_RATE_LIMIT=true
 ```
 
 #
@@ -112,7 +112,7 @@ python ncinstagramdl.py
 
 ### Blocking & Recovery
 - **RateLimitError** (HTTP 429, “Please wait a few minutes”, “Temporarily blocked”):
-  If `AUTO_RETRY_RATE_LIMIT=true`, the app auto-retries the **same item** using a fixed schedule:
+  If `AUTO_RETRY_ON_RATE_LIMIT=true`, the app auto-retries the **same item** using a fixed schedule:
   **75s → 150s → 300s → 600s → 1200s → 2400s → 4800s (cap)**.
   If set to `false`, you’ll get an interactive prompt to retry/skip/quit. Waiting works best; skipping rarely helps.
 
