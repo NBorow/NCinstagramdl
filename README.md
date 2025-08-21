@@ -79,7 +79,7 @@ Open **Settings** from the app and apply a preset:
 You can also edit individual values (e.g., toggle `SAFER_MANUAL_LOGIN`, change `PROFILE_DIR`).
 
 ## Using Instagram Data Exports
-1. Visit the Instagram Data Download page: https://accountscenter.instagram.com/info_and_permissions/dyi/  
+1. Visit the Instagram Data Download page: https://accountscenter.meta.com/info_and_permissions/dyi  
 2. Request your data, wait for the email, download the ZIP.  
 3. Unzip into `PROFILE_DUMP_DIRECTORY`.
 
