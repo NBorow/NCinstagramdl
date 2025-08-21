@@ -26,6 +26,26 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.txt')
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), 'insta_cookies.txt')
 PAGE_SIZE = 10
 
+# --- Centralized Chrome options builder ---
+def build_chrome_options(profile_dir: str, window_size: str = "1280,900") -> Options:
+    """
+    Build standardized Chrome options with minimal flags and persistent profile.
+    
+    Args:
+        profile_dir: Directory for persistent Chrome profile
+        window_size: Window size as "width,height" string
+        
+    Returns:
+        Options: Configured Chrome options
+    """
+    opts = Options()
+    opts.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
+    opts.add_argument(f"--window-size={window_size}")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    return opts
+
 # --- Config parsing helpers for manual login ---
 def parse_bool(s: str, default: bool) -> bool:
 	if s is None: return default
@@ -304,30 +324,10 @@ def are_cookies_valid(cookie_file=COOKIE_FILE):
 # --- Manual login with persistent Chrome profile ---
 def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 	os.makedirs(profile_dir, exist_ok=True)
-
-	options = Options()
-	options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")  # persistent profile
-	options.add_argument("--disable-blink-features=AutomationControlled")
-	options.add_argument("--no-first-run")
-	options.add_argument("--no-default-browser-check")
-	options.add_argument("--window-size=1200,800")
-	options.add_argument("--window-position=100,100")
-	options.add_experimental_option("excludeSwitches", ["enable-automation"])
-	options.add_experimental_option('useAutomationExtension', False)
-	options.add_argument("--disable-dev-shm-usage")
-	options.add_argument("--no-sandbox")
-	options.add_argument("--disable-gpu")
-	options.add_argument("--disable-web-security")
-	options.add_argument("--disable-features=VizDisplayCompositor")
-	options.add_argument("--log-level=3")
-	options.add_argument("--silent")
-	options.add_argument("--disable-logging")
-	options.add_argument("--disable-dev-shm-usage")
-	options.add_argument("--disable-gpu-sandbox")
-	options.add_argument("--disable-software-rasterizer")
-	options.add_argument("--disable-background-timer-throttling")
-	options.add_argument("--disable-backgrounding-occluded-windows")
-	options.add_argument("--disable-renderer-backgrounding")
+	
+	print(f"[Manual Login] Using profile directory: {os.path.abspath(profile_dir)}")
+	
+	options = build_chrome_options(profile_dir, "1280,900")
 
 	driver = None
 	try:
@@ -364,29 +364,7 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 			pass
 
 def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: str) -> bool:
-	options = Options()
-	options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
-	options.add_argument("--disable-blink-features=AutomationControlled")
-	options.add_argument("--no-first-run")
-	options.add_argument("--no-default-browser-check")
-	options.add_argument("--window-size=1200,800")
-	options.add_argument("--window-position=100,100")
-	options.add_experimental_option("excludeSwitches", ["enable-automation"])
-	options.add_experimental_option('useAutomationExtension', False)
-	options.add_argument("--disable-dev-shm-usage")
-	options.add_argument("--no-sandbox")
-	options.add_argument("--disable-gpu")
-	options.add_argument("--disable-web-security")
-	options.add_argument("--disable-features=VizDisplayCompositor")
-	options.add_argument("--log-level=3")
-	options.add_argument("--silent")
-	options.add_argument("--disable-logging")
-	options.add_argument("--disable-dev-shm-usage")
-	options.add_argument("--disable-gpu-sandbox")
-	options.add_argument("--disable-software-rasterizer")
-	options.add_argument("--disable-background-timer-throttling")
-	options.add_argument("--disable-backgrounding-occluded-windows")
-	options.add_argument("--disable-renderer-backgrounding")
+	options = build_chrome_options(profile_dir, "1280,900")
 	
 	driver = None
 	try:
@@ -1125,13 +1103,7 @@ def get_profile_post_urls(username):
         profile_dir, _ = resolve_profile_and_cookie(config)
         
         # Set up Chrome options
-        options = Options()
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_argument("--start-maximized")
-        options.add_argument(f"--user-data-dir={os.path.abspath(profile_dir)}")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--no-sandbox")
+        options = build_chrome_options(profile_dir, "1280,900")
         
         # Create driver
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
