@@ -9,6 +9,7 @@ import random
 import shutil
 from collections import deque
 from datetime import datetime
+from glob import glob
 from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -947,6 +948,23 @@ def ensure_unique_dir(base_dir: str, name: str) -> str:
 			return cand
 		i += 1
 
+def _shortcode_from_share_link(url: str) -> str | None:
+	if not url: return None
+	try:
+		u = urlparse(url)
+		host = (u.netloc or "").lower()
+		if "instagram.com" not in host:
+			return None
+		parts = [p for p in (u.path or "").split("/") if p]
+		if not parts: 
+			return None
+		# Accept only structured share types; no raw-link fallback
+		if parts[0] in ("reel", "p", "tv") and len(parts) > 1:
+			return parts[1]
+		return None
+	except Exception:
+		return None
+
 def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     """
     Extract posts and profiles from DM JSON file.
@@ -1657,10 +1675,71 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         thread_dir = ensure_unique_dir(dm_download_dir, thread_name)
         print(f"[DM] Saving this conversation to: {thread_dir}")
         
-        # Extract posts and profiles
-        posts, profiles, send_text_hits = extract_dm_posts_and_profiles(msg_file, thread_name)
-        
-        print(f"Found {len(posts)} shared posts and {len(profiles)} shared profiles")
+        # Gather all message parts for this DM thread
+        thread_root = os.path.dirname(msg_file)  # msg_file is the selected message_*.json
+        part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
+
+        all_msgs = []
+        for pf in part_files:
+            try:
+                with open(pf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    all_msgs.extend(data.get("messages", []))
+            except Exception as e:
+                print(f"[DM] Skipping {pf}: {e}")
+
+        # Sort by ascending timestamp for reliable <1s pairing across parts
+        all_msgs.sort(key=lambda m: m.get("timestamp_ms", 0))
+
+        seen_shortcodes = set()
+        posts = []
+        send_text_hits = 0
+
+        for i, m in enumerate(all_msgs):
+            share = m.get("share") or {}
+            link = share.get("link")
+            if not link:
+                continue  # no raw-link fallback; only structured shares
+
+            shortcode = _shortcode_from_share_link(link)
+            if not shortcode or shortcode in seen_shortcodes:
+                continue
+            seen_shortcodes.add(shortcode)
+
+            ts = m.get("timestamp_ms")
+            sender = (m.get("sender_name") or "").strip()
+            orig_owner = (share.get("original_content_owner") or "").strip() or None
+            caption_raw = (share.get("share_text") or "").strip() or None
+
+            # Pair a send message if next is same sender and within <1s
+            send_text = None
+            if i + 1 < len(all_msgs):
+                nxt = all_msgs[i + 1]
+                if (nxt.get("sender_name") or "").strip() == sender:
+                    nts = nxt.get("timestamp_ms")
+                    if isinstance(ts, int) and isinstance(nts, int) and 0 <= (nts - ts) <= 1000:
+                        if isinstance(nxt.get("content"), str) and nxt["content"].strip():
+                            send_text = nxt["content"].strip()
+                            send_text_hits += 1
+
+            post = {
+                'shortcode': shortcode,
+                'url': link,
+                'description': None,
+                'original_owner': orig_owner,
+                'caption_raw': caption_raw,
+                'caption': normalize_caption_text(caption_raw) if caption_raw else None,
+                'source': 'dm',
+                'username': orig_owner,
+                'timestamp_ms': ts,
+                'dm_thread': thread_name,
+            }
+            if send_text:
+                post['send_text'] = send_text
+
+            posts.append(post)
+
+        print(f"Found {len(posts)} shared posts from {len(part_files)} message parts")
         
         # Check for send message append option
         append_send_for_this_run = False
@@ -1669,24 +1748,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
             choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
             append_send_for_this_run = (choice == 'y')
         
-        # Handle profile downloads
-        if profiles:
-            response = input(f"This DM includes {len(profiles)} shared profiles. Download all their posts? (y/n): ").strip().lower()
-            if response == 'y':
-                # Create profile downloads directory only when user chooses to download
-                profile_download_dir = os.path.join(thread_dir, "full_profiles")
-                os.makedirs(profile_download_dir, exist_ok=True)
-                print(f"Profile downloads will be saved to: {profile_download_dir}")
-                
-                for profile in profiles:
-                    username = profile['username']
-                    # Pass send message flag to profile downloads
-                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name, safety_config, append_send_for_this_run)
-                    total_profiles += 1
-            else:
-                print("Skipping profile downloads as requested.")
-        
-        # Download shared posts
+        # Download the collected posts for this thread into the per-thread folder
         for i, post in enumerate(posts, 1):
             print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
             
