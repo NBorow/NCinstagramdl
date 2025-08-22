@@ -1093,25 +1093,17 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	try:
 		# Create gallery-dl specific filename template with proper extension handling
 		# gallery-dl uses {extension} instead of %(ext)s
-		# For carousels, we want: shortcode/shortcode_{num}.{extension} (creates folder)
-		# For single posts, we want: shortcode.{extension} (no folder)
 		base_filename = filename_template.replace('.%(ext)s', '')
 		
-		# Use the actual shortcode for folder creation (with send message suffix if applicable)
-		base = post_data.get('shortcode', 'unknown')
-		if post_data.get('append_send_for_this_run') and post_data.get('send_text') and post_data.get('source') in ('dm','dm_profile'):
-			slug = slug_from_send_text(post_data['send_text'])
-			if slug:
-				base = f"{base}_{slug}"
-		
-		gallery_filename = f'{base}/{{shortcode}}_{{num}}.{{extension}}'
+		# Flat file pattern for gallery-dl; matches yt-dlp base, adds {num} for carousels
+		gallery_filename = f"{base_filename}_{{num}}.{{extension}}"
 
 		cmd = [
 			'gallery-dl',
 			'--cookies', COOKIE_FILE,
-			'--directory', download_dir,  # Force exact directory, no subfolders
+			'--directory', download_dir,
 			'--filename', gallery_filename,
-			'--exec', 'echo {filepath}',        # NEW: print each saved file
+			'--exec', 'echo {filepath}',
 			url
 		]
 		
@@ -1128,9 +1120,26 @@ def download_post(conn, post_data, download_dir, pacer=None):
 				raise LoginRequiredError(result.stderr or "login required")
 		
 		if result.returncode == 0:
-			# pick the last absolute-looking path from stdout
+			# collect all absolute-looking paths gallery-dl printed
 			candidates = [l.strip() for l in result.stdout.splitlines() if is_abs_pathish(l)]
 			saved_path = candidates[-1] if candidates else None
+			
+			# If exactly one created file, drop the trailing "_1" in its stem
+			if len(candidates) == 1:
+				stem, ext = os.path.splitext(os.path.basename(saved_path))
+				# expected stem pattern: f"{base_filename}_1"
+				# build the expected stem to be safe
+				expected_prefix = os.path.basename(base_filename)
+				if stem == f"{expected_prefix}_1":
+					dst = os.path.join(download_dir, f"{expected_prefix}{ext}")
+					if not os.path.exists(dst):
+						try:
+							os.rename(saved_path, dst)
+							saved_path = dst
+						except Exception as _e:
+							# If rename fails, keep original path; continue
+							pass
+			
 			if saved_path and not os.path.isabs(saved_path):
 				saved_path = os.path.abspath(os.path.join(download_dir, saved_path))
 			status = record_download(conn, post_data, saved_path)   # pass path
