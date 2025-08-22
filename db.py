@@ -24,19 +24,21 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute('''
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shortcode TEXT UNIQUE NOT NULL,
+            shortcode TEXT NOT NULL,
             url TEXT NOT NULL,
             description TEXT,
             original_owner TEXT,
-            share_text TEXT,
-            source TEXT, -- 'dm', 'saved', 'liked', 'profile'
+            caption_raw TEXT,            -- NEW: original as found (DM snapshot or live)
+            caption TEXT,                -- NEW: normalized/cleaned for filenames/search
+            source TEXT,                 -- e.g., 'dm','saved','liked','profile'
             username TEXT,
             timestamp_ms INTEGER,
             downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'success', -- 'success', 'failed', 'skipped'
+            status TEXT DEFAULT 'success',   -- 'success' | 'failed' | 'skipped'
             error_message TEXT,
             dm_thread TEXT,
-            local_path TEXT                -- NEW
+            local_path TEXT,
+            UNIQUE(shortcode, source)
         )
     ''')
     
@@ -106,7 +108,7 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
     Args:
         conn: Database connection
         post: Dictionary containing post information with keys:
-              shortcode, url, description, original_owner, share_text,
+              shortcode, url, description, original_owner, caption_raw, caption,
               source, username, timestamp_ms, status (optional)
         local_path: Optional path to the downloaded file
               
@@ -116,30 +118,31 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
     try:
         conn.execute('''
             INSERT INTO posts (
-                shortcode, url, description, original_owner, share_text,
+                shortcode, url, description, original_owner, caption_raw, caption,
                 source, username, timestamp_ms, status, downloaded_at,
                 error_message, dm_thread, local_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
-            ON CONFLICT(shortcode) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
+            ON CONFLICT(shortcode, source) DO UPDATE SET
                 status='success',
                 error_message=NULL,
                 downloaded_at=CURRENT_TIMESTAMP,
                 url=excluded.url,
                 description=excluded.description,
                 original_owner=excluded.original_owner,
-                share_text=excluded.share_text,
-                source=excluded.source,
+                caption_raw=excluded.caption_raw,
+                caption=excluded.caption,
                 username=excluded.username,
                 timestamp_ms=excluded.timestamp_ms,
-                dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread),
-                local_path=COALESCE(excluded.local_path, posts.local_path)
+                dm_thread=excluded.dm_thread,
+                local_path=excluded.local_path
         ''', (
             post.get('shortcode'),
             post.get('url'),
             post.get('description'),
             post.get('original_owner'),
-            post.get('share_text'),
+            post.get('caption_raw'),
+            post.get('caption'),
             post.get('source'),
             post.get('username'),
             post.get('timestamp_ms'),
@@ -168,30 +171,30 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
     try:
         conn.execute('''
             INSERT INTO posts (
-                shortcode, url, description, original_owner, share_text,
+                shortcode, url, description, original_owner, caption_raw, caption,
                 source, username, timestamp_ms, status, error_message,
-                downloaded_at, dm_thread, local_path
+                downloaded_at, dm_thread
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?, NULL)
-            ON CONFLICT(shortcode) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(shortcode, source) DO UPDATE SET
                 status='failed',
                 error_message=excluded.error_message,
                 downloaded_at=CURRENT_TIMESTAMP,
-                url=COALESCE(excluded.url, posts.url),
-                description=COALESCE(excluded.description, posts.description),
-                original_owner=COALESCE(excluded.original_owner, posts.original_owner),
-                share_text=COALESCE(excluded.share_text, posts.share_text),
-                source=COALESCE(excluded.source, posts.source),
-                username=COALESCE(excluded.username, posts.username),
-                timestamp_ms=COALESCE(excluded.timestamp_ms, posts.timestamp_ms),
-                dm_thread=COALESCE(excluded.dm_thread, posts.dm_thread),
-                local_path=COALESCE(excluded.local_path, posts.local_path)
+                url=excluded.url,
+                description=excluded.description,
+                original_owner=excluded.original_owner,
+                caption_raw=excluded.caption_raw,
+                caption=excluded.caption,
+                username=excluded.username,
+                timestamp_ms=excluded.timestamp_ms,
+                dm_thread=excluded.dm_thread
         ''', (
             post.get('shortcode'),
             post.get('url'),
             post.get('description'),
             post.get('original_owner'),
-            post.get('share_text'),
+            post.get('caption_raw'),
+            post.get('caption'),
             post.get('source'),
             post.get('username'),
             post.get('timestamp_ms'),
