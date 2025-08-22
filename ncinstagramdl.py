@@ -22,6 +22,43 @@ import requests
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
+# --- Caption normalization helpers ---
+def _mojibake_candidate(s: str) -> bool:
+	return any('\u0080' <= ch <= '\u00FF' for ch in s)
+
+def _looks_much_better(a: str, b: str) -> bool:
+	bad = "ÃÂØð¢¬¤§"
+	score = lambda s: (sum(ch.isalnum() for ch in s) - sum(ch in bad for ch in s))
+	return score(a) > score(b)
+
+def repair_mojibake(s: str) -> str:
+	if not s: return s
+	if _mojibake_candidate(s):
+		try:
+			cand = s.encode('latin-1','ignore').decode('utf-8','ignore')
+			if _looks_much_better(cand, s):
+				return cand
+		except Exception:
+			pass
+	return s
+
+def normalize_caption_text(s: str) -> str:
+	if not s: return s
+	s = repair_mojibake(s)
+	s = unicodedata.normalize("NFKC", s)
+	# strip zero-width/control chars, collapse spaces
+	s = ''.join(ch if (ch >= ' ' and ch not in '\u200b\u200c\u200d\u2060') else ' ' for ch in s)
+	s = re.sub(r'\s+', ' ', s).strip()
+	return s
+
+def clean_text_for_filename(s: str, max_len: int | None = None) -> str:
+	if not s: return s
+	s = normalize_caption_text(s)
+	s = sanitize_filename(s)   # keep your existing sanitizer
+	if max_len and len(s) > max_len:
+		s = s[:max_len-1] + '…'
+	return s
+
 # --- Exception classes for recoverable errors ---
 class RateLimitError(Exception): pass
 class CheckpointError(Exception): pass
@@ -847,23 +884,13 @@ def generate_filename(post_data, max_length=200):
     if original_owner:
         parts.append(f"by_{original_owner}")
     
-    # Add share text if present
-    share_text = post_data.get('share_text', '')
-    if share_text:
-        parts.append(sanitize_filename(share_text))
-    
     # Add caption if present and there's room
     caption = post_data.get('caption', '')
     if caption:
-        # Calculate remaining space for caption
-        current_length = sum(len(part) + 1 for part in parts)  # +1 for underscores
-        remaining_space = max_length - current_length - 10  # Leave room for extension
-        
-        if remaining_space > 10:  # Only add if we have meaningful space
-            sanitized_caption = sanitize_filename(caption)
-            if len(sanitized_caption) > remaining_space:
-                sanitized_caption = sanitized_caption[:remaining_space-3] + "..."
-            parts.append(sanitized_caption)
+        current_len = sum(len(p) + 1 for p in parts)
+        remaining = max_length - current_len - 10
+        if remaining > 10:
+            parts.append(clean_text_for_filename(caption, max_len=remaining))
     
     # Join parts with underscores
     filename = "_".join(parts)
@@ -985,12 +1012,13 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
                         break
             
             # Create post data
+            raw = (share_data['share_text'] or '').strip() or None
             post_data = {
                 'shortcode': share_data['shortcode'],
                 'url': share_data['url'],
                 'original_owner': share_data['original_owner'],
-                'share_text': share_data['share_text'],
-                'caption': None,  # Currently not available in DM shares
+                'caption_raw': raw,
+                'caption': normalize_caption_text(raw) if raw else None,
                 'timestamp_ms': share_data['timestamp_ms'],
                 'source': 'dm',
                 'dm_thread': thread_name,
@@ -1420,12 +1448,13 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
             post_caption = post_data.get(post_url, "")
             
             # Create post data structure
+            raw = (post_caption or '').strip() or None
             post_data_dict = {
                 'shortcode': shortcode,
                 'url': post_url,
                 'original_owner': username,
-                'share_text': '',
-                'caption': post_caption,
+                'caption_raw': raw,
+                'caption': normalize_caption_text(raw) if raw else None,
                 'timestamp_ms': int(time.time() * 1000),
                 'source': source,
                 'dm_thread': thread_name,
