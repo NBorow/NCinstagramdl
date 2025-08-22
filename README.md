@@ -44,6 +44,11 @@ SAFER_MANUAL_LOGIN=true
 
 # Auto-retry when Instagram rate-limits you (HTTP 429 / "Please wait a few minutes")
 AUTO_RETRY_ON_RATE_LIMIT=true
+
+# Optional: Ask to append DM send messages to filenames
+# When enabled, detects text messages sent <1s after sharing posts in DMs
+# and offers to append them as filename suffixes (e.g., CrAb1234_cute_message.mp4)
+ASK_FOR_SEND_MESSAGE_APPEND=false
 ```
 
 #
@@ -93,7 +98,16 @@ python ncinstagramdl.py
 
 ## What Gets Downloaded
 - **DM Download**: downloads shared posts in selected conversations. Profile shares can optionally trigger full profile grabs (depending on options shown in-app).
-- Top-level **Profile / Liked / Saved** entries may indicate “not yet implemented” if those workflows are pending.
+- Top-level **Profile / Liked / Saved** entries may indicate "not yet implemented" if those workflows are pending.
+
+### DM Send Message Classification
+When `ASK_FOR_SEND_MESSAGE_APPEND=true` is set in config.txt, the app can detect and use "send messages" from DM conversations to classify downloaded posts:
+
+- **Send Message Detection**: Looks for human text messages sent by the same person within 1 second of sharing an Instagram post
+- **Filename Enhancement**: If detected, prompts once per DM thread to append these messages as filename suffixes
+- **Example**: A post shared with "cute!" sent immediately after becomes `CrAb1234_cute.mp4` instead of `CrAb1234.mp4`
+- **Use Cases**: Useful for organizing posts by context, reactions, or comments made when sharing in conversations
+- **Safety**: Only affects DM downloads, preserves original Instagram captions, and converts text to safe filename characters
 
 ## Cookies and Downloader Integration
 - Cookies are exported in **Netscape format** and reused by **yt-dlp** / **gallery-dl**.  

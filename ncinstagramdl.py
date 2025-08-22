@@ -792,6 +792,15 @@ def sanitize_filename(filename):
     filename = filename.strip()
     return filename
 
+def slug_from_send_text(s: str, max_len: int = 40) -> str:
+	if not s: return ""
+	s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+	# keep letters/numbers/space/_/-
+	s = re.sub(r"[^A-Za-z0-9 _-]+", "", s)
+	# collapse whitespace -> underscores
+	s = re.sub(r"\s+", "_", s).strip("_")
+	return s[:max_len] if len(s) >= 3 else ""
+
 def to_file_uri(path: str) -> str:
 	p = os.path.abspath(path)
 	if os.name == 'nt':
@@ -826,6 +835,12 @@ def generate_filename(post_data, max_length=200):
     shortcode = post_data.get('shortcode', '')
     if shortcode:
         parts.append(shortcode)
+    
+    # Add send message suffix if enabled and available
+    if post_data.get('append_send_for_this_run') and post_data.get('send_text') and post_data.get('source') in ('dm','dm_profile'):
+        slug = slug_from_send_text(post_data['send_text'])
+        if slug:
+            parts.append(slug)
     
     # Add original owner if present
     original_owner = post_data.get('original_owner', '')
@@ -895,10 +910,11 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
         thread_name: Name of the DM thread/conversation
         
     Returns:
-        tuple: (posts_list, profiles_list)
+        tuple: (posts_list, profiles_list, send_text_hits)
     """
     posts = []
     profiles = []
+    send_text_hits = 0
     
     try:
         with open(dm_json_path, 'r', encoding='utf-8') as f:
@@ -907,8 +923,9 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
         # Navigate to messages array
         messages = data.get('messages', [])
         
-        for message in messages:
-            # Check if message has a share
+        # First pass: collect all shares and their timestamps/senders
+        shares = []
+        for i, message in enumerate(messages):
             if 'share' in message:
                 share = message['share']
                 link = share.get('link', '')
@@ -931,22 +948,60 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
                     # Post share
                     shortcode = extract_shortcode_from_url(link)
                     if shortcode:
-                        post_data = {
+                        share_data = {
+                            'index': i,
                             'shortcode': shortcode,
                             'url': link,
                             'original_owner': share.get('original_owner', ''),
                             'share_text': share.get('share_text', ''),
-                            'caption': None,  # Currently not available in DM shares
                             'timestamp_ms': message.get('timestamp_ms', 0),
+                            'sender': message.get('sender_name', ''),
                             'source': 'dm',
                             'dm_thread': thread_name
                         }
-                        posts.append(post_data)
+                        shares.append(share_data)
+        
+        # Second pass: for each share, look for send messages
+        for share_data in shares:
+            share_ts = share_data['timestamp_ms']
+            share_sender = share_data['sender']
+            share_index = share_data['index']
+            
+            # Look for send message: next human text message by same sender within 1s
+            send_text = None
+            for j in range(share_index + 1, len(messages)):
+                msg = messages[j]
+                msg_ts = msg.get('timestamp_ms', 0)
+                msg_sender = msg.get('sender_name', '')
+                
+                # Check if this is a human text message (not a system/reaction line)
+                if 'content' in msg and msg_sender == share_sender:
+                    time_diff = msg_ts - share_ts
+                    if 0 < time_diff < 1000:  # Strictly under 1s
+                        send_text = msg['content']
+                        send_text_hits += 1
+                        break
+                    elif time_diff >= 1000:  # Too late, stop looking
+                        break
+            
+            # Create post data
+            post_data = {
+                'shortcode': share_data['shortcode'],
+                'url': share_data['url'],
+                'original_owner': share_data['original_owner'],
+                'share_text': share_data['share_text'],
+                'caption': None,  # Currently not available in DM shares
+                'timestamp_ms': share_data['timestamp_ms'],
+                'source': 'dm',
+                'dm_thread': thread_name,
+                'send_text': send_text  # Add send_text field
+            }
+            posts.append(post_data)
     
     except Exception as e:
         print(f"Error parsing DM JSON {dm_json_path}: {e}")
     
-    return posts, profiles
+    return posts, profiles, send_text_hits
 
 def download_post(conn, post_data, download_dir, pacer=None):
 	"""
@@ -1042,10 +1097,14 @@ def download_post(conn, post_data, download_dir, pacer=None):
 		# For single posts, we want: shortcode.{extension} (no folder)
 		base_filename = filename_template.replace('.%(ext)s', '')
 		
-		# Use the actual shortcode for folder creation
-		# This should create a folder named after the post for carousels
-		shortcode = post_data.get('shortcode', 'unknown')
-		gallery_filename = f'{shortcode}/{{shortcode}}_{{num}}.{{extension}}'
+		# Use the actual shortcode for folder creation (with send message suffix if applicable)
+		base = post_data.get('shortcode', 'unknown')
+		if post_data.get('append_send_for_this_run') and post_data.get('send_text') and post_data.get('source') in ('dm','dm_profile'):
+			slug = slug_from_send_text(post_data['send_text'])
+			if slug:
+				base = f"{base}_{slug}"
+		
+		gallery_filename = f'{base}/{{shortcode}}_{{num}}.{{extension}}'
 
 		cmd = [
 			'gallery-dl',
@@ -1290,7 +1349,7 @@ def get_profile_post_urls(username):
         print(f"[ERROR] Error using Selenium for @{username}: {e}")
         return [], {}
 
-def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None, safety_config=None):
+def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None, safety_config=None, append_send_for_this_run=False):
     """
     Download all posts from a user's profile using Selenium scraping.
     
@@ -1301,6 +1360,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         source: Source identifier for database
         pacer: SafetyPacer instance for rate limiting
         thread_name: DM thread name for database tracking
+        safety_config: Safety configuration
+        append_send_for_this_run: Whether to append send messages to filenames
         
     Returns:
         bool: True if any posts were downloaded successfully
@@ -1358,7 +1419,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                 'caption': post_caption,
                 'timestamp_ms': int(time.time() * 1000),
                 'source': source,
-                'dm_thread': thread_name
+                'dm_thread': thread_name,
+                'append_send_for_this_run': append_send_for_this_run
             }
             
             # Use our existing download method with exception handling
@@ -1519,6 +1581,9 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
     config = read_config()
     download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
     
+    # Parse send message append config
+    ASK_FOR_SEND_MESSAGE_APPEND = parse_bool(config.get("ASK_FOR_SEND_MESSAGE_APPEND"), False)
+    
     # Create download directory structure
     dm_download_dir = os.path.join(download_base_dir, "dms")
     os.makedirs(dm_download_dir, exist_ok=True)
@@ -1533,9 +1598,16 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         print(f"\nProcessing {thread_name}...")
         
         # Extract posts and profiles
-        posts, profiles = extract_dm_posts_and_profiles(msg_file, thread_name)
+        posts, profiles, send_text_hits = extract_dm_posts_and_profiles(msg_file, thread_name)
         
         print(f"Found {len(posts)} shared posts and {len(profiles)} shared profiles")
+        
+        # Check for send message append option
+        append_send_for_this_run = False
+        if ASK_FOR_SEND_MESSAGE_APPEND and send_text_hits > 0:
+            print(f"Detected {send_text_hits} send messages (<1s after shares) in this conversation.")
+            choice = input("Append them to filenames for this run? [y/N]: ").strip().lower()
+            append_send_for_this_run = (choice == 'y')
         
         # Handle profile downloads
         if profiles:
@@ -1548,7 +1620,8 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                 
                 for profile in profiles:
                     username = profile['username']
-                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name, safety_config)
+                    # Pass send message flag to profile downloads
+                    download_profile_posts(conn, username, profile_download_dir, 'dm_profile', pacer, thread_name, safety_config, append_send_for_this_run)
                     total_profiles += 1
             else:
                 print("Skipping profile downloads as requested.")
@@ -1556,6 +1629,9 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         # Download shared posts
         for i, post in enumerate(posts, 1):
             print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
+            
+            # Add send message flag to post data
+            post['append_send_for_this_run'] = append_send_for_this_run
             
             # Use our existing download method with exception handling
             retry_count = 0
