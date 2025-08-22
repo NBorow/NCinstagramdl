@@ -928,6 +928,25 @@ def extract_shortcode_from_url(url):
     
     return None
 
+def ensure_unique_dir(base_dir: str, name: str) -> str:
+	"""
+	Create a unique subfolder of base_dir using a sanitized name.
+	If the folder exists, append -2, -3, ... until unique.
+	"""
+	safe = sanitize_filename(name) or "thread"
+	target = os.path.join(base_dir, safe)
+	if not os.path.exists(target):
+		os.makedirs(target, exist_ok=True)
+		return target
+	# Resolve collisions conservatively
+	i = 2
+	while True:
+		cand = os.path.join(base_dir, f"{safe}-{i}")
+		if not os.path.exists(cand):
+			os.makedirs(cand, exist_ok=True)
+			return cand
+		i += 1
+
 def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     """
     Extract posts and profiles from DM JSON file.
@@ -1635,6 +1654,9 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         thread_name = os.path.basename(os.path.dirname(msg_file))
         print(f"\nProcessing {thread_name}...")
         
+        thread_dir = ensure_unique_dir(dm_download_dir, thread_name)
+        print(f"[DM] Saving this conversation to: {thread_dir}")
+        
         # Extract posts and profiles
         posts, profiles, send_text_hits = extract_dm_posts_and_profiles(msg_file, thread_name)
         
@@ -1652,7 +1674,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
             response = input(f"This DM includes {len(profiles)} shared profiles. Download all their posts? (y/n): ").strip().lower()
             if response == 'y':
                 # Create profile downloads directory only when user chooses to download
-                profile_download_dir = os.path.join(dm_download_dir, "full_profiles")
+                profile_download_dir = os.path.join(thread_dir, "full_profiles")
                 os.makedirs(profile_download_dir, exist_ok=True)
                 print(f"Profile downloads will be saved to: {profile_download_dir}")
                 
@@ -1675,7 +1697,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
             retry_count = 0
             while True:
                 try:
-                    ok = download_post(conn, post, dm_download_dir, pacer)
+                    ok = download_post(conn, post, thread_dir, pacer)
                     # success or non-block failure -> break to next item
                     if ok:
                         total_posts += 1
