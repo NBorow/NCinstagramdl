@@ -53,8 +53,8 @@ ASK_FOR_SEND_MESSAGE_APPEND=false
 
 #
 
-#### Completely manual cookie import (optional)
-Already logged in on your normal browser? Export **web cookies** for `instagram.com` in **Netscape format** (via a cookie exporter extension) and place the file where the app expects it (e.g., `./cookies/insta_cookies.txt`). This avoids re-auth in Selenium and often reduces checkpoints. Keep it **per-account** and treat the file like a password.
+#### Completely manual cookie import (recommended)
+**Safest method**: Already logged in on your normal browser? Export **web cookies** for `instagram.com` in **Netscape format** (via a cookie exporter extension) and place the file where the app expects it (e.g., `./cookies/insta_cookies.txt`). This avoids Selenium automation entirely and uses your existing, trusted session. Keep it **per-account** and treat the file like a password.
 
 **Which cookies matter?** Must-haves: `sessionid`, `ds_user_id`, `csrftoken`. Nice-to-haves: `mid`, `ig_did`, `rur`, `shbid`, `shbts`, `ig_nrcb`.
 ## Login and Cookies
