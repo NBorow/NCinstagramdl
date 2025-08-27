@@ -957,6 +957,16 @@ def ensure_unique_dir(base_dir: str, name: str) -> str:
 			return cand
 		i += 1
 
+def ensure_thread_dir(base_dir: str, name: str) -> str:
+	"""
+	Create a stable subfolder for DM threads that reuses the same folder per conversation.
+	No suffixing with -2, -3, etc. - always uses the same folder name.
+	"""
+	safe = sanitize_filename(name) or "thread"
+	target = os.path.join(base_dir, safe)
+	os.makedirs(target, exist_ok=True)
+	return target
+
 def _shortcode_from_share_link(url: str) -> str | None:
 	if not url: return None
 	try:
@@ -1677,15 +1687,18 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
     total_posts = 0
     total_profiles = 0
     
-    for msg_file in selected_files:
-        thread_name = os.path.basename(os.path.dirname(msg_file))
-        print(f"\nProcessing {thread_name}...")
-        
-        thread_dir = ensure_unique_dir(dm_download_dir, thread_name)
+    # turn selected_files (paths to message_*.json) into unique thread roots
+    selected_threads = sorted({os.path.dirname(p) for p in selected_files})
+
+    for thread_root in selected_threads:
+        thread_name = os.path.basename(thread_root)
+        print(f"\nProcessing {thread_name}.")
+
+        # reuse existing folder; no -2/-3 suffixing
+        thread_dir = ensure_thread_dir(dm_download_dir, thread_name)
         print(f"[DM] Saving this conversation to: {thread_dir}")
-        
-        # Gather all message parts for this DM thread
-        thread_root = os.path.dirname(msg_file)  # msg_file is the selected message_*.json
+
+        # gather all message parts for this thread
         part_files = sorted(glob(os.path.join(thread_root, "message_*.json")))
 
         all_msgs = []
