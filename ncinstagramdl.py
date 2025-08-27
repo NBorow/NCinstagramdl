@@ -19,6 +19,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import requests
+import sys
+import select
 
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
@@ -259,28 +261,35 @@ class SafetyPacer:
 
     def before_download(self):
         self.wait_caps()
-        delay = random.uniform(self.min_delay, self.max_delay)
-        if self.max_delay > 0:
-            print(f"[SAFE] Sleeping {int(delay)}s before download... (Press Enter to skip)")
-            # Use a shorter sleep interval to check for user input
-            remaining = delay
-            while remaining > 0:
-                sleep_interval = min(1.0, remaining)  # Check every second or remaining time
-                time.sleep(sleep_interval)
-                remaining -= sleep_interval
-                
-                # Check if user pressed Enter (non-blocking input check)
+        sleep_interval = random.randint(self.min_delay, self.max_delay)
+        
+        if os.name == 'nt':
+            # Windows: keep msvcrt-based instant skip
+            print(f"[SAFE] Sleeping {sleep_interval}s before download... (Press Enter to skip)")
+            start = time.time()
+            while True:
+                remaining = sleep_interval - (time.time() - start)
+                if remaining <= 0:
+                    break
                 try:
                     import msvcrt
                     if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        if key == b'\r':  # Enter key
-                            print("[SAFE] Break skipped by user")
+                        ch = msvcrt.getwch()
+                        if ch in ('\r', '\n'):
+                            print("[SAFE] Skip requested.")
                             break
                 except ImportError:
-                    # On non-Windows systems, we can't do non-blocking input easily
-                    # Just continue with the sleep
                     pass
+                time.sleep(0.05)
+        else:
+            # POSIX
+            if sys.stdin.isatty():
+                print(f"[SAFE] Sleeping {sleep_interval}s before download... (Press Enter to skip)")
+                _posix_wait_with_enter(sleep_interval)
+            else:
+                # Non-interactive: no hint; just sleep
+                print(f"[SAFE] Sleeping {sleep_interval}s before download...")
+                time.sleep(sleep_interval)
 
     def after_success(self):
         now = time.time()
@@ -290,28 +299,32 @@ class SafetyPacer:
             self.day_q.append(now)
         self.success_count += 1
         if self.every > 0 and (self.success_count % self.every == 0):
-            long_break = random.uniform(self.long_min, self.long_max)
-            if self.long_max > 0:
-                print(f"[SAFE] Long break: {int(long_break)}s (Press Enter to skip)")
-                # Use a shorter sleep interval to check for user input
-                remaining = long_break
-                while remaining > 0:
-                    sleep_interval = min(1.0, remaining)  # Check every second or remaining time
-                    time.sleep(sleep_interval)
-                    remaining -= sleep_interval
-                    
-                    # Check if user pressed Enter (non-blocking input check)
+            long_sleep = random.randint(self.long_min, self.long_max)
+            
+            if os.name == 'nt':
+                print(f"[SAFE] Long break: {long_sleep}s (Press Enter to skip)")
+                start = time.time()
+                while True:
+                    remaining = long_sleep - (time.time() - start)
+                    if remaining <= 0:
+                        break
                     try:
                         import msvcrt
                         if msvcrt.kbhit():
-                            key = msvcrt.getch()
-                            if key == b'\r':  # Enter key
-                                print("[SAFE] Long break skipped by user")
+                            ch = msvcrt.getwch()
+                            if ch in ('\r', '\n'):
+                                print("[SAFE] Long break skipped.")
                                 break
                     except ImportError:
-                        # On non-Windows systems, we can't do non-blocking input easily
-                        # Just continue with the sleep
                         pass
+                    time.sleep(0.05)
+            else:
+                if sys.stdin.isatty():
+                    print(f"[SAFE] Long break: {long_sleep}s (Press Enter to skip)")
+                    _posix_wait_with_enter(long_sleep)
+                else:
+                    print(f"[SAFE] Long break: {long_sleep}s")
+                    time.sleep(long_sleep)
 
 # Helper to check if a file exists and is non-empty
 def file_exists_nonempty(path):
@@ -966,6 +979,25 @@ def ensure_thread_dir(base_dir: str, name: str) -> str:
 	target = os.path.join(base_dir, safe)
 	os.makedirs(target, exist_ok=True)
 	return target
+
+def _posix_wait_with_enter(seconds: float) -> None:
+	"""
+	On POSIX TTY, wait up to `seconds` but abort early if user presses Enter.
+	No-op skip if stdin is not a TTY.
+	"""
+	if seconds <= 0:
+		return
+	if not sys.stdin or not sys.stdin.isatty():
+		time.sleep(seconds)
+		return
+	# Wait for either input or timeout
+	r, _, _ = select.select([sys.stdin], [], [], seconds)
+	if r:
+		try:
+			# Consume the line (treat any line as 'skip')
+			sys.stdin.readline()
+		except Exception:
+			pass
 
 def _shortcode_from_share_link(url: str) -> str | None:
 	if not url: return None
