@@ -7,6 +7,9 @@ import subprocess
 import unicodedata
 import random
 import shutil
+import sys
+import datetime
+import atexit
 from collections import deque
 from datetime import datetime
 from glob import glob
@@ -145,6 +148,66 @@ def resolve_profile_and_cookie(config):
 	profile_dir = normalize_profile_dir(config.get("PROFILE_DIR"))
 	cookie_file = COOKIE_FILE
 	return profile_dir, cookie_file
+
+
+# --- Logging globals ---
+RUN_LOG_DIR = None
+RUN_LOG_PATH = None
+FAIL_LOG_PATH = None
+
+
+def resolve_log_dir(config: dict) -> str:
+	"""
+	Return absolute path for LOG_DIRECTORY. If not set, default to ./logs.
+	Creates the directory if it doesn't exist.
+	"""
+	default_logs = os.path.join(os.getcwd(), "logs")
+	log_dir = get_cfg_str(config, "LOG_DIRECTORY", default_logs)
+	log_dir = os.path.abspath(log_dir)
+	os.makedirs(log_dir, exist_ok=True)
+	return log_dir
+
+
+def _install_run_logger(log_dir: str) -> str:
+	"""
+	Mirror all stdout/stderr to a single per-run file under log_dir.
+	Returns the path to the run log file.
+	"""
+	os.makedirs(log_dir, exist_ok=True)
+	ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+	path = os.path.join(log_dir, f"run-{ts}.log")
+	f = open(path, "a", encoding="utf-8", buffering=1)
+
+	class _Tee:
+		def __init__(self, stream):
+			self.stream = stream
+		def write(self, s):
+			try:
+				self.stream.write(s)
+			finally:
+				f.write(s)
+		def flush(self):
+			try:
+				self.stream.flush()
+			finally:
+				f.flush()
+
+	sys.stdout = _Tee(sys.stdout)
+	sys.stderr = _Tee(sys.stderr)
+	atexit.register(lambda: (f.flush(), f.close()))
+	print(f"[LOG] Writing this run to: {path}")
+	return path
+
+
+def log_total_failure(msg: str):
+	global FAIL_LOG_PATH, RUN_LOG_DIR
+	if not FAIL_LOG_PATH:
+		# fallback if called before main() (shouldn't happen, but safe)
+		RUN_LOG_DIR = RUN_LOG_DIR or os.path.join(os.getcwd(), "logs")
+		os.makedirs(RUN_LOG_DIR, exist_ok=True)
+		FAIL_LOG_PATH = os.path.join(RUN_LOG_DIR, "total_failures.log")
+	with open(FAIL_LOG_PATH, "a", encoding="utf-8") as fh:
+		fh.write(msg.rstrip() + "\n")
 
 # --- New: Profile dump scan logic ---
 PROFILE_POSTS_PATH = os.path.join('your_instagram_activity', 'media', 'posts_1.json')
@@ -1263,12 +1326,11 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	try:
 		from datetime import datetime
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-		failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}\n"
+		failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}"
 		
-		with open("total_failures.log", "a", encoding="utf-8") as f:
-			f.write(failure_log_entry)
+		log_total_failure(failure_log_entry)
 		
-		print(f"[DEBUG] Total failure logged to total_failures.log")
+		print(f"[DEBUG] Total failure logged to {FAIL_LOG_PATH}")
 	except Exception as e:
 		print(f"[DEBUG] Failed to log to file: {e}")
 	
@@ -1893,6 +1955,13 @@ def read_config():
     return config
 
 
+def get_cfg_str(cfg: dict, key: str, default: str) -> str:
+    val = cfg.get(key)
+    if val is None:
+        return default
+    return str(val).strip() or default
+
+
 
 def get_profile_dumps_dir():
     config = read_config()
@@ -2092,6 +2161,15 @@ def settings_menu():
 def main():
     config = read_config()
     
+    # Resolve log directory, install run logger
+    global RUN_LOG_DIR, RUN_LOG_PATH, FAIL_LOG_PATH
+    RUN_LOG_DIR = resolve_log_dir(config)
+    RUN_LOG_PATH = _install_run_logger(RUN_LOG_DIR)
+    FAIL_LOG_PATH = os.path.join(RUN_LOG_DIR, "total_failures.log")
+    
+    # (optional) echo where failures will be recorded
+    print(f"[LOG] Failures will append to: {FAIL_LOG_PATH}")
+    
     # Initialize SQLite database
     db_path = os.path.join(os.path.dirname(__file__), 'downloaded_posts.db')
     conn = init_db(db_path)
@@ -2213,6 +2291,12 @@ def main():
     finally:
         # Clean exit - close database connection
         close_db(conn)
+        
+        # Print log paths at the end
+        if RUN_LOG_PATH:
+            print(f"[LOG] Full run log: {RUN_LOG_PATH}")
+        if FAIL_LOG_PATH and os.path.exists(FAIL_LOG_PATH):
+            print(f"[LOG] Failures file: {FAIL_LOG_PATH}")
 
 if __name__ == "__main__":
     main() 
