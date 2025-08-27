@@ -44,18 +44,27 @@ def repair_mojibake(s: str) -> str:
 	return s
 
 def normalize_caption_text(s: str) -> str:
-	if not s: return s
-	s = repair_mojibake(s)
-	s = unicodedata.normalize("NFKC", s)
-	# strip zero-width/control chars, collapse spaces
-	s = ''.join(ch if (ch >= ' ' and ch not in '\u200b\u200c\u200d\u2060') else ' ' for ch in s)
-	s = re.sub(r'\s+', ' ', s).strip()
-	return s
+    if not s:
+        return s
+    # Existing steps
+    s = repair_mojibake(s)
+    s = unicodedata.normalize("NFKC", s)
+    # strip zero-width/control chars, collapse spaces
+    s = ''.join(ch if (ch >= ' ' and ch not in '\u200b\u200c\u200d\u2060') else ' ' for ch in s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    # NEW: force ASCII only (drop emojis and non-Latin)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return s
 
 def clean_text_for_filename(s: str, max_len: int | None = None) -> str:
-	if not s: return s
+	"""
+	ASCII-only captions for filenames:
+	normalize -> ASCII-only -> collapse whitespace -> sanitize -> truncate.
+	"""
+	if not s:
+		return s
 	s = normalize_caption_text(s)
-	s = sanitize_filename(s)   # keep your existing sanitizer
+	s = sanitize_filename(s)  # keep your existing sanitizer unchanged
 	if max_len and len(s) > max_len:
 		s = s[:max_len-1] + '…'
 	return s
