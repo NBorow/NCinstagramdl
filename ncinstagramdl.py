@@ -7,6 +7,8 @@ import subprocess
 import unicodedata
 import random
 import shutil
+import signal
+import threading
 from collections import deque
 from datetime import datetime
 from glob import glob
@@ -33,6 +35,33 @@ from db import (
     close_db,
     get_recent_download_timestamps,
 )
+
+# --- Shutdown primitives ---
+SHUTDOWN = threading.Event()
+_SIGINT_COUNT = 0
+
+
+def _signal_handler(signum, frame):
+    global _SIGINT_COUNT
+    _SIGINT_COUNT += 1
+    if _SIGINT_COUNT == 1:
+        print("\n[CTRL-C] Received. Finishing current item, then exiting cleanly... (press Ctrl-C again to force quit)")
+        SHUTDOWN.set()
+    else:
+        print("\n[CTRL-C] Forcing exit now.")
+        try:
+            os._exit(130)
+        except Exception:
+            raise SystemExit(130)
+
+
+def install_signal_handlers():
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        # On Windows older Pythons, SIGTERM may not be supported; ignore.
+        pass
 
 
 # --- Caption normalization helpers ---
@@ -100,6 +129,19 @@ class CheckpointError(Exception):
 
 class LoginRequiredError(Exception):
     pass
+
+
+class RunStats:
+    def __init__(self):
+        self.success = 0
+        self.failed = 0
+        self.skipped = 0
+
+    def __str__(self):
+        return f"success={self.success}, failed={self.failed}, skipped={self.skipped}"
+
+
+RUN_STATS = RunStats()
 
 
 # --- Rate limit configuration ---
@@ -309,10 +351,14 @@ class SafetyPacer:
                 sleeps.append(self.hour_q[0] + 3600 - now)
             if not self._unlimited(self.day_cap) and len(self.day_q) >= self.day_cap:
                 sleeps.append(self.day_q[0] + 86400 - now)
-            time.sleep(max(1, int(max(sleeps))))
+            sleep_time = max(1, int(max(sleeps)))
+            if sleep_with_cancel(sleep_time):
+                return  # Shutdown requested
 
     def before_download(self):
         self.wait_caps()
+        if SHUTDOWN.is_set():
+            return False
         sleep_interval = random.randint(self.min_delay, self.max_delay)
 
         if os.name == "nt":
@@ -325,6 +371,8 @@ class SafetyPacer:
                 remaining = sleep_interval - (time.time() - start)
                 if remaining <= 0:
                     break
+                if SHUTDOWN.is_set():
+                    return False
                 try:
                     import msvcrt
 
@@ -342,11 +390,14 @@ class SafetyPacer:
                 print(
                     f"[SAFE] Sleeping {sleep_interval}s before download... (Press Enter to skip)"
                 )
-                _posix_wait_with_enter(sleep_interval)
+                if sleep_with_cancel(sleep_interval):
+                    return False
             else:
                 # Non-interactive: no hint; just sleep
                 print(f"[SAFE] Sleeping {sleep_interval}s before download...")
-                time.sleep(sleep_interval)
+                if sleep_with_cancel(sleep_interval):
+                    return False
+        return True
 
     def after_success(self):
         now = time.time()
@@ -365,6 +416,8 @@ class SafetyPacer:
                     remaining = long_sleep - (time.time() - start)
                     if remaining <= 0:
                         break
+                    if SHUTDOWN.is_set():
+                        return
                     try:
                         import msvcrt
 
@@ -379,10 +432,12 @@ class SafetyPacer:
             else:
                 if sys.stdin.isatty():
                     print(f"[SAFE] Long break: {long_sleep}s (Press Enter to skip)")
-                    _posix_wait_with_enter(long_sleep)
+                    if sleep_with_cancel(long_sleep):
+                        return
                 else:
                     print(f"[SAFE] Long break: {long_sleep}s")
-                    time.sleep(long_sleep)
+                    if sleep_with_cancel(long_sleep):
+                        return
 
 
 # Helper to check if a file exists and is non-empty
@@ -1160,6 +1215,23 @@ def _posix_wait_with_enter(seconds: float) -> None:
             pass
 
 
+def sleep_with_cancel(seconds: float) -> bool:
+    """
+    Sleep up to 'seconds'; wake early if SHUTDOWN is set.
+    Returns True if a shutdown was requested during the wait.
+    """
+    if seconds <= 0:
+        return SHUTDOWN.is_set()
+    # Wait in slices to keep UI responsive (and to honor Windows console behavior)
+    end = time.time() + seconds
+    while not SHUTDOWN.is_set():
+        remaining = end - time.time()
+        if remaining <= 0:
+            break
+        SHUTDOWN.wait(min(remaining, 0.5))
+    return SHUTDOWN.is_set()
+
+
 def _version_line(cmd: list[str]) -> str | None:
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
@@ -1200,6 +1272,13 @@ def check_env() -> None:
             )
         else:
             print("         • See: https://ffmpeg.org/download.html\n")
+
+
+def print_exit_summary(download_base_dir: str | None = None):
+    print("\n=== Run Summary ===")
+    print(f"Items: {RUN_STATS}")
+    if download_base_dir:
+        print(f"Downloads at: {download_base_dir}")
 
 
 def _shortcode_from_share_link(url: str) -> str | None:
@@ -1348,11 +1427,10 @@ def download_post(conn, post_data, download_dir, pacer=None):
     # Check if already downloaded
     if is_downloaded(conn, shortcode):
         print(f"[SKIPPED] {shortcode} already recorded")
+        RUN_STATS.skipped += 1
         return True
 
-    # Safety pacing before download
-    if pacer:
-        pacer.before_download()
+    # Safety pacing is now handled by callers to avoid double-sleeping
 
     # Generate filename
     filename_template = generate_filename(post_data)
@@ -1401,8 +1479,10 @@ def download_post(conn, post_data, download_dir, pacer=None):
                     print(f"[LINK]  {to_file_uri(saved_path)}")
                 if pacer:
                     pacer.after_success()
+                RUN_STATS.success += 1
             elif status == "duplicate":
                 print(f"[DUPLICATE] {shortcode} already in database")
+                RUN_STATS.skipped += 1
             else:
                 print(f"[ERROR] {shortcode} → database error")
             return True
@@ -1481,8 +1561,10 @@ def download_post(conn, post_data, download_dir, pacer=None):
                     print(f"[LINK]  {to_file_uri(saved_path)}")
                 if pacer:
                     pacer.after_success()
+                RUN_STATS.success += 1
             elif status == "duplicate":
                 print(f"[DUPLICATE] {shortcode} already in database")
+                RUN_STATS.skipped += 1
             else:
                 print(f"[ERROR] {shortcode} → database error")
             return True
@@ -1499,10 +1581,13 @@ def download_post(conn, post_data, download_dir, pacer=None):
     status = record_failure(conn, post_data, error_msg)
     if status == "inserted":
         print(f"[ERROR] {shortcode} → {error_msg}")
+        RUN_STATS.failed += 1
     elif status == "duplicate":
         print(f"[DUPLICATE] {shortcode} failure already recorded")
+        RUN_STATS.skipped += 1
     else:
         print(f"[ERROR] {shortcode} → database error recording failure")
+        RUN_STATS.failed += 1
 
     # Log total failure to file for debugging
     try:
@@ -1765,6 +1850,8 @@ def download_profile_posts(
         skipped_count = 0
 
         for i, post_url in enumerate(post_urls, 1):
+            if SHUTDOWN.is_set():
+                break
             print(f"[PROFILE] Downloading post {i}/{len(post_urls)}: {post_url}")
 
             # Extract shortcode from URL
@@ -1796,6 +1883,12 @@ def download_profile_posts(
                 "append_send_for_this_run": append_send_for_this_run,
             }
 
+            # Check if we should proceed with download
+            if pacer:
+                ok_to_start = pacer.before_download()
+                if not ok_to_start or SHUTDOWN.is_set():
+                    break
+
             # Use our existing download method with exception handling
             retry_count = 0
             while True:
@@ -1825,7 +1918,8 @@ def download_profile_posts(
                             min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
                         ]
                         print(f"[BLOCK] Auto-retrying this item in {delay}s...")
-                        time.sleep(delay)
+                        if sleep_with_cancel(delay):
+                            return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
@@ -1836,7 +1930,8 @@ def download_profile_posts(
                         print(
                             f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry..."
                         )
-                        time.sleep(delay)
+                        if sleep_with_cancel(delay):
+                            return False  # Shutdown requested
                         retry_count += 1
                         continue
                     resp = (
@@ -2025,6 +2120,8 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
     selected_threads = sorted({os.path.dirname(p) for p in selected_files})
 
     for thread_root in selected_threads:
+        if SHUTDOWN.is_set():
+            break
         thread_name = os.path.basename(thread_root)
         print(f"\nProcessing {thread_name}.")
 
@@ -2117,10 +2214,18 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
 
         # Download the collected posts for this thread into the per-thread folder
         for i, post in enumerate(posts, 1):
+            if SHUTDOWN.is_set():
+                break
             print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
 
             # Add send message flag to post data
             post["append_send_for_this_run"] = append_send_for_this_run
+
+            # Check if we should proceed with download
+            if pacer:
+                ok_to_start = pacer.before_download()
+                if not ok_to_start or SHUTDOWN.is_set():
+                    break
 
             # Use our existing download method with exception handling
             retry_count = 0
@@ -2146,7 +2251,8 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                             min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
                         ]
                         print(f"[BLOCK] Auto-retrying this item in {delay}s...")
-                        time.sleep(delay)
+                        if sleep_with_cancel(delay):
+                            return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
@@ -2157,7 +2263,8 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         print(
                             f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry..."
                         )
-                        time.sleep(delay)
+                        if sleep_with_cancel(delay):
+                            return False  # Shutdown requested
                         retry_count += 1
                         continue
                     resp = (
@@ -2231,9 +2338,17 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                             print("[BLOCK] Manual login failed, retrying anyway...")
                     # else retry immediately
 
-    print(f"\nDM download complete!")
-    print(f"Total posts downloaded: {total_posts}")
-    print(f"Total profiles processed: {total_profiles}")
+        if SHUTDOWN.is_set():
+            break
+
+    if not SHUTDOWN.is_set():
+        print(f"\nDM download complete!")
+        print(f"Total posts downloaded: {total_posts}")
+        print(f"Total profiles processed: {total_profiles}")
+    else:
+        print(f"\nDM download interrupted.")
+        print(f"Posts downloaded before interruption: {total_posts}")
+        print(f"Profiles processed before interruption: {total_profiles}")
 
     return True
 
@@ -2475,9 +2590,13 @@ def main():
     # Check environment and tool versions
     check_env()
 
+    # Install signal handlers for graceful shutdown
+    install_signal_handlers()
+
     # Initialize SQLite database
     db_path = os.path.join(os.path.dirname(__file__), "downloaded_posts.db")
     conn = init_db(db_path)
+    download_base_dir = None
 
     try:
         # --- New cookie gate with manual/automated login flow ---
@@ -2495,6 +2614,9 @@ def main():
         if not dumps:
             print("No profile dumps found.")
             return
+
+        # Get download directory from config
+        download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
 
         dump_availability = {}
         for name, path in dumps:
@@ -2609,9 +2731,23 @@ def main():
                 print(invalid_msg)
                 input("Press Enter to continue...")
 
+    except KeyboardInterrupt:
+        # If anything slipped through, convert to graceful shutdown
+        SHUTDOWN.set()
     finally:
-        # Clean exit - close database connection
-        close_db(conn)
+        try:
+            # Ensure DB is flushed & closed if you hold a conn
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                close_db(conn)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        print_exit_summary(download_base_dir)
 
 
 if __name__ == "__main__":
