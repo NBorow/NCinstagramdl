@@ -146,6 +146,27 @@ def clean_text_for_filename(s: str, max_len: int | None = None) -> str:
 		s = s[:max_len-1] + '…'
 	return s
 
+def build_output_basename(post: dict, config: dict) -> str:
+    """
+    Returns base name WITHOUT extension template (i.e., no '.%(ext)s').
+    Applies ASCII-cleaned caption. Optionally prepends post date.
+    """
+    shortcode = post.get("shortcode") or "unknown"
+    owner = post.get("original_owner") or "unknown"
+    caption = clean_text_for_filename(post.get("caption") or "")
+    base = f"{shortcode}_by_{owner}_{caption}".rstrip("_")
+
+    if parse_bool(config.get("APPEND_POST_DATE"), False) and post.get("timestamp_ms"):
+        try:
+            dt = datetime.fromtimestamp(post["timestamp_ms"] / 1000.0)
+            prefix = dt.strftime("%Y%m%d_%H%M")
+            base = f"{prefix}_{base}"
+        except Exception:
+            # On any parsing issue, fall back to non-prefixed.
+            pass
+
+    return base
+
 # --- Exception classes for recoverable errors ---
 class RateLimitError(Exception): pass
 class CheckpointError(Exception): pass
@@ -1203,7 +1224,7 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
     
     return posts, profiles, send_text_hits
 
-def download_post(conn, post_data, download_dir, pacer=None):
+def download_post(conn, post_data, download_dir, pacer=None, config=None):
 	"""
 	Download a single Instagram post using yt-dlp with fallback to gallery-dl.
 	
@@ -1212,6 +1233,7 @@ def download_post(conn, post_data, download_dir, pacer=None):
 		post_data: Dictionary containing post information
 		download_dir: Directory to save the download
 		pacer: SafetyPacer instance for rate limiting
+		config: Configuration dictionary
 		
 	Returns:
 		bool: True if download successful, False otherwise
@@ -1238,8 +1260,15 @@ def download_post(conn, post_data, download_dir, pacer=None):
 			return False
     
 	# Generate filename
-	filename_template = generate_filename(post_data)
-	output_path = os.path.join(download_dir, filename_template)
+	if config and parse_bool(config.get("APPEND_POST_DATE"), False):
+		# Use new date-prefixed filename format
+		basename = build_output_basename(post_data, config)
+		filename_template = basename + ".%(ext)s"
+		output_path = os.path.join(download_dir, filename_template)
+	else:
+		# Use existing filename format
+		filename_template = generate_filename(post_data)
+		output_path = os.path.join(download_dir, filename_template)
 	
 	print(f"Downloading {shortcode}...")
 	
@@ -1301,10 +1330,14 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	try:
 		# Create gallery-dl specific filename template with proper extension handling
 		# gallery-dl uses {extension} instead of %(ext)s
-		base_filename = filename_template.replace('.%(ext)s', '')
-		
-		# Flat file pattern for gallery-dl; matches yt-dlp base, adds {num} for carousels
-		gallery_filename = f"{base_filename}_{{num}}.{{extension}}"
+		if config and parse_bool(config.get("APPEND_POST_DATE"), False):
+			# Use new date-prefixed filename format for gallery-dl
+			basename = build_output_basename(post_data, config)
+			gallery_filename = f"{basename}_{{num}}.{{extension}}"
+		else:
+			# Use existing filename format
+			base_filename = filename_template.replace('.%(ext)s', '')
+			gallery_filename = f"{base_filename}_{{num}}.{{extension}}"
 
 		cmd = [
 			'gallery-dl',
@@ -1571,7 +1604,7 @@ def get_profile_post_urls(username):
         print(f"[ERROR] Error using Selenium for @{username}: {e}")
         return [], {}
 
-def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None, safety_config=None, append_send_for_this_run=False):
+def download_profile_posts(conn, username, download_dir, source='dm_profile', pacer=None, thread_name=None, safety_config=None, append_send_for_this_run=False, config=None):
     """
     Download all posts from a user's profile using Selenium scraping.
     
@@ -1652,7 +1685,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
             retry_count = 0
             while True:
                 try:
-                    ok = download_post(conn, post_data_dict, profile_dir, pacer)
+                    ok = download_post(conn, post_data_dict, profile_dir, pacer, config)
                     # success or non-block failure -> break to next item
                     if ok:
                         successful_downloads += 1
@@ -1745,7 +1778,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         print(f"[ERROR] Profile @{username} - {e}")
         return False
 
-def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
+def process_dm_download(conn, selected_path, pacer=None, safety_config=None, config=None):
     """
     Process DM downloads from a selected profile dump.
     
@@ -1917,7 +1950,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
             retry_count = 0
             while True:
                 try:
-                    ok = download_post(conn, post, thread_dir, pacer)
+                    ok = download_post(conn, post, thread_dir, pacer, config)
                     # success or non-block failure -> break to next item
                     if ok:
                         total_posts += 1
@@ -2010,6 +2043,10 @@ def read_config():
             if '=' in line:
                 key, value = line.split('=', 1)
                 config[key.strip()] = value.strip()
+    
+    # Set defaults for optional config keys
+    config.setdefault("APPEND_POST_DATE", "false")
+    
     return config
 
 
@@ -2293,7 +2330,7 @@ def main():
                                 
                                 # Handle different download options
                                 if "DM Download" in selected_option:
-                                    result = process_dm_download(conn, selected_path, pacer, safety_config)
+                                    result = process_dm_download(conn, selected_path, pacer, safety_config, config)
                                     if result is True:
                                         # Print download statistics only if completed
                                         print("\nDownload Statistics:")
