@@ -18,6 +18,8 @@ A menu-driven tool for managing Instagram data exports (“profile dumps”) and
   ```
 - Optional but recommended: **ffmpeg** on PATH (for media merges)
 
+The app checks for ffmpeg at startup and strongly recommends installing it. Without ffmpeg, some downloads may skip merging/transcoding and can fail depending on format.
+
 ## Installation
 ```sh
 git clone <your-repo-url>
@@ -49,6 +51,11 @@ AUTO_RETRY_ON_RATE_LIMIT=true
 # When enabled, detects text messages sent <1s after sharing posts in DMs
 # and offers to append them as filename suffixes (e.g., CrAb1234_cute_message.mp4)
 ASK_FOR_SEND_MESSAGE_APPEND=false
+
+# Prepend post publish date to filenames (off by default)
+# Resulting pattern:
+#   YYYYMMDD_HHMM_<shortcode>_by_<owner>_<caption_snippet>.%(ext)s
+APPEND_POST_DATE=false
 ```
 
 #
@@ -109,6 +116,8 @@ When `ASK_FOR_SEND_MESSAGE_APPEND=true` is set in config.txt, the app can detect
 - **Use Cases**: Useful for organizing posts by context, reactions, or comments made when sharing in conversations
 - **Safety**: Only affects DM downloads, preserves original Instagram captions, and converts text to safe filename characters
 
+Filenames are ASCII-safe and length-capped. If APPEND_POST_DATE=true, filenames are prefixed with the post's publish datetime (YYYYMMDD_HHMM_…). This does not change database records—only the on-disk name.
+
 ## Cookies and Downloader Integration
 - Cookies are exported in **Netscape format** and reused by **yt-dlp** / **gallery-dl**.  
 - The downloader calls remain unchanged and read the same cookie file every run.  
@@ -119,21 +128,26 @@ When `ASK_FOR_SEND_MESSAGE_APPEND=true` is set in config.txt, the app can detect
 - Summaries/stats are printed after runs.  
 - Safe to keep between runs for dedupe.
 
+## Session Summary & Logs
+On clean exit or Ctrl-C, the app prints a session summary (attempts, successes, failures, skips, rate-limit/checkpoint counts, success rate).
+
+Console output is tee'd to a run log in the configured log directory (path is printed at startup). Failures are also appended to total_failures.log.
+
+Use these logs to resume work, inspect errors, or post-process (e.g., build sorted "views" from DB metadata).
+
 ## Safety and Pacing
 - Human-like per-request delays, periodic long breaks, and backoff on errors.  
-- On Windows, you can press Enter to skip a long break if a prompt indicates it.
+- During waits, if you see "(Press Enter to skip)", you can press Enter to skip on Windows and Linux/macOS (POSIX TTYs). In non-interactive runs (cron/systemd/nohup), the prompt is suppressed and waits are non-skippable.
 
 
 ### Blocking & Recovery
-- **RateLimitError** (HTTP 429, “Please wait a few minutes”, “Temporarily blocked”):
-  If `AUTO_RETRY_ON_RATE_LIMIT=true`, the app auto-retries the **same item** using a fixed schedule:
-  **75s → 150s → 300s → 600s → 1200s → 2400s → 4800s (cap)**.
-  If set to `false`, you’ll get an interactive prompt to retry/skip/quit. Waiting works best; skipping rarely helps.
+- **RateLimitError** (429 / "Please wait a few minutes" / temporary block):
+If AUTO_RETRY_ON_RATE_LIMIT=true, the app automatically retries the same item using an exponential schedule with ±15% jitter (e.g., ~75s → ~150s → ~300s → …, capped). Jitter avoids synchronized retry bursts. If set to false, you'll get an interactive prompt (retry / delayed retry / skip / quit).
 
-- **LoginRequiredError** (“login required”, “not logged in”):
+- **LoginRequiredError** ("login required", "not logged in"):
   Cookies/session are invalid or expired. Use **manual login now** (persistent Chrome profile) or refresh your cookies, then retry.
 
-- **CheckpointError** (“verify it’s you”, `challenge_required`):
+- **CheckpointError** ("verify it's you", `challenge_required`):
   Complete manual verification in the persistent profile, then **wait ~30–60 minutes** before resuming, or switch accounts/profiles. Prompt offers: retry / manual-login-now / skip / quit.
 
 ## Notes
