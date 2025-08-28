@@ -27,6 +27,124 @@ import requests
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
 
+# --- Pre-flight checks ---
+def check_ffmpeg_availability():
+    """
+    Check if ffmpeg is available on the system.
+    Returns True if found, False otherwise.
+    """
+    try:
+        # Check if ffmpeg is available in PATH
+        result = subprocess.run(['ffmpeg', '-version'], 
+                              capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+def print_ffmpeg_warning():
+    """
+    Print a strong recommendation to install ffmpeg.
+    """
+    print("\n" + "="*80)
+    print("⚠️  FFMPEG NOT FOUND ⚠️")
+    print("="*80)
+    print("FFmpeg is not installed or not available in your system PATH.")
+    print()
+    print("FFmpeg is STRONGLY RECOMMENDED for:")
+    print("• Merging video and audio streams from Instagram posts")
+    print("• Converting media formats for better compatibility")
+    print("• Handling complex media downloads")
+    print()
+    print("Installation options:")
+    print("• Windows: Download from https://ffmpeg.org/download.html")
+    print("• macOS: brew install ffmpeg")
+    print("• Ubuntu/Debian: sudo apt install ffmpeg")
+    print("• CentOS/RHEL: sudo yum install ffmpeg")
+    print()
+    print("After installation, restart this program.")
+    print("="*80)
+    print()
+
+# --- Session tracking for summary ---
+class SessionTracker:
+    def __init__(self):
+        self.start_time = time.time()
+        self.downloads_attempted = 0
+        self.downloads_successful = 0
+        self.downloads_failed = 0
+        self.downloads_skipped = 0
+        self.rate_limits_hit = 0
+        self.checkpoints_hit = 0
+        self.login_required_hits = 0
+        self.errors = []
+    
+    def record_download_attempt(self):
+        self.downloads_attempted += 1
+    
+    def record_download_success(self):
+        self.downloads_successful += 1
+    
+    def record_download_failure(self):
+        self.downloads_failed += 1
+    
+    def record_download_skip(self):
+        self.downloads_skipped += 1
+    
+    def record_rate_limit(self):
+        self.rate_limits_hit += 1
+    
+    def record_checkpoint(self):
+        self.checkpoints_hit += 1
+    
+    def record_login_required(self):
+        self.login_required_hits += 1
+    
+    def record_error(self, error_msg):
+        self.errors.append(error_msg)
+    
+    def get_session_summary(self):
+        """Generate a comprehensive session summary."""
+        duration = time.time() - self.start_time
+        hours = int(duration // 3600)
+        minutes = int((duration % 3600) // 60)
+        seconds = int(duration % 60)
+        
+        summary = []
+        summary.append("\n" + "="*60)
+        summary.append("📊 SESSION SUMMARY")
+        summary.append("="*60)
+        summary.append(f"Session duration: {hours:02d}:{minutes:02d}:{seconds:02d}")
+        summary.append("")
+        summary.append("Download Statistics:")
+        summary.append(f"  • Attempted: {self.downloads_attempted}")
+        summary.append(f"  • Successful: {self.downloads_successful}")
+        summary.append(f"  • Failed: {self.downloads_failed}")
+        summary.append(f"  • Skipped: {self.downloads_skipped}")
+        
+        if self.downloads_attempted > 0:
+            success_rate = (self.downloads_successful / self.downloads_attempted) * 100
+            summary.append(f"  • Success rate: {success_rate:.1f}%")
+        
+        summary.append("")
+        summary.append("Rate Limiting Events:")
+        summary.append(f"  • Rate limits hit: {self.rate_limits_hit}")
+        summary.append(f"  • Checkpoints encountered: {self.checkpoints_hit}")
+        summary.append(f"  • Login required events: {self.login_required_hits}")
+        
+        if self.errors:
+            summary.append("")
+            summary.append("Errors encountered:")
+            for error in self.errors[-5:]:  # Show last 5 errors
+                summary.append(f"  • {error}")
+            if len(self.errors) > 5:
+                summary.append(f"  • ... and {len(self.errors) - 5} more errors")
+        
+        summary.append("="*60)
+        return "\n".join(summary)
+
+# Global session tracker
+SESSION_TRACKER = SessionTracker()
+
 # --- Shutdown + cancelable sleep helpers ---
 SHUTDOWN = threading.Event()
 _SIGINT_COUNT = 0
@@ -152,6 +270,22 @@ class LoginRequiredError(Exception): pass
 
 # --- Rate limit configuration ---
 RATE_LIMIT_SCHEDULE = [75, 150, 300, 600, 1200, 2400, 4800]  # seconds
+
+def get_jittered_delay(base: int | float, jitter: float = 0.15) -> float:
+    """
+    Add jitter to a delay to make it more human-like.
+    
+    Args:
+        base: Base delay in seconds
+        jitter: Percentage of jitter to add (0.0 to 1.0), default 0.15 (15%)
+        
+    Returns:
+        float: Jittered delay in seconds, rounded to 1 decimal place
+    """
+    # ±15% jitter by default
+    low = max(0, base * (1 - jitter))
+    high = base * (1 + jitter)
+    return round(random.uniform(low, high), 1)
 
 def parse_bool(s: str, default: bool) -> bool:
 	if s is None: return default
@@ -1209,7 +1343,11 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	# Check if already downloaded
 	if is_downloaded(conn, shortcode):
 		print(f"[SKIPPED] {shortcode} already recorded")
+		SESSION_TRACKER.record_download_skip()
 		return True
+	
+	# Record download attempt
+	SESSION_TRACKER.record_download_attempt()
 	
 	# Safety pacing before download; honor cancel
 	if pacer:
@@ -1260,10 +1398,13 @@ def download_post(conn, post_data, download_dir, pacer=None):
 					print(f"[LINK]  {to_file_uri(saved_path)}")
 				if pacer:
 					pacer.after_success()
+				SESSION_TRACKER.record_download_success()
 			elif status == "duplicate":
 				print(f"[DUPLICATE] {shortcode} already in database")
+				SESSION_TRACKER.record_download_skip()
 			else:
 				print(f"[ERROR] {shortcode} → database error")
+				SESSION_TRACKER.record_error(f"Database error for {shortcode}")
 			return True
 		else:
 			print(f"yt-dlp failed for {shortcode}: {result.stderr}")
@@ -1352,10 +1493,13 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	status = record_failure(conn, post_data, error_msg)
 	if status == "inserted":
 		print(f"[ERROR] {shortcode} → {error_msg}")
+		SESSION_TRACKER.record_download_failure()
+		SESSION_TRACKER.record_error(f"Download failed: {shortcode} - {error_msg}")
 	elif status == "duplicate":
 		print(f"[DUPLICATE] {shortcode} failure already recorded")
 	else:
 		print(f"[ERROR] {shortcode} → database error recording failure")
+		SESSION_TRACKER.record_error(f"Database error recording failure for {shortcode}")
 	
 	# Log total failure to file for debugging
 	try:
@@ -1635,20 +1779,23 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         print(f"[FAILED] Post {i}/{len(post_urls)} for @{username}")
                     break
                 except RateLimitError as e:
+                    SESSION_TRACKER.record_rate_limit()
                     print(f"\n[BLOCK] Rate limited.")
                     print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        delay = get_jittered_delay(base_delay)
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s (base: {base_delay}s + jitter)...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
                     if retry_count > 0:  # delayed retry mode
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        delay = get_jittered_delay(base_delay)
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s (base: {base_delay}s + jitter) before retry...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
@@ -1658,6 +1805,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         return False
                     if resp == "s":
                         record_failure(conn, post_data_dict, "Skipped after rate limit")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "d":
                         retry_count = 0  # start delayed retry mode at first step
@@ -1673,6 +1821,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         return False
                     if resp == "s":
                         record_failure(conn, post_data_dict, "Skipped during checkpoint")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "m":
                         # Get current profile and cookie file
@@ -1691,6 +1840,7 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         return False
                     if resp == "s":
                         record_failure(conn, post_data_dict, "Skipped after login-required")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "m":
                         # Get current profile and cookie file
@@ -1893,20 +2043,23 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         total_posts += 1
                     break
                 except RateLimitError as e:
+                    SESSION_TRACKER.record_rate_limit()
                     print(f"\n[BLOCK] Rate limited.")
                     print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        delay = get_jittered_delay(base_delay)
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s (base: {base_delay}s + jitter)...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
                     if retry_count > 0:  # delayed retry mode
-                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
-                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
+                        base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        delay = get_jittered_delay(base_delay)
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s (base: {base_delay}s + jitter) before retry...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
@@ -1916,6 +2069,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         return False
                     if resp == "s":
                         record_failure(conn, post, "Skipped after rate limit")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "d":
                         retry_count = 0  # start delayed retry mode at first step
@@ -1931,6 +2085,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         return False
                     if resp == "s":
                         record_failure(conn, post, "Skipped during checkpoint")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "m":
                         # Get current profile and cookie file
@@ -1949,6 +2104,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                         return False
                     if resp == "s":
                         record_failure(conn, post, "Skipped after login-required")
+                        SESSION_TRACKER.record_download_skip()
                         break
                     if resp == "m":
                         # Get current profile and cookie file
@@ -2185,6 +2341,11 @@ def main():
     # Install signal handlers early
     install_signal_handlers()
     
+    # --- Pre-flight ffmpeg check ---
+    if not check_ffmpeg_availability():
+        print_ffmpeg_warning()
+        # Continue anyway, but user is warned
+    
     # Initialize SQLite database
     db_path = os.path.join(os.path.dirname(__file__), 'downloaded_posts.db')
     conn = init_db(db_path)
@@ -2304,6 +2465,9 @@ def main():
                 input("Press Enter to continue...")
     
     finally:
+        # Print session summary on exit
+        print(SESSION_TRACKER.get_session_summary())
+        
         # Clean exit - close database connection
         close_db(conn)
 
