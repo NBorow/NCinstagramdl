@@ -8,8 +8,9 @@ import unicodedata
 import random
 import shutil
 import sys
-import datetime
-import atexit
+import select
+import threading
+import signal
 from collections import deque
 from datetime import datetime
 from glob import glob
@@ -25,6 +26,78 @@ import requests
 
 # Import database functions
 from db import init_db, is_downloaded, get_post, record_download, record_failure, get_download_stats, close_db, get_recent_download_timestamps
+
+# --- Shutdown + cancelable sleep helpers ---
+SHUTDOWN = threading.Event()
+_SIGINT_COUNT = 0
+
+def _signal_handler(signum, frame):
+	global _SIGINT_COUNT
+	_SIGINT_COUNT += 1
+	if _SIGINT_COUNT == 1:
+		print("\n[CTRL-C] Received. Finishing current item, then exiting cleanly... (press Ctrl-C again to force quit)")
+		SHUTDOWN.set()
+	else:
+		print("\n[CTRL-C] Forcing exit now.")
+		try:
+			os._exit(130)
+		except Exception:
+			raise SystemExit(130)
+
+def install_signal_handlers():
+	try:
+		signal.signal(signal.SIGINT, _signal_handler)
+		signal.signal(signal.SIGTERM, _signal_handler)
+	except Exception:
+		# On some platforms (e.g., older Windows), SIGTERM may not be available.
+		pass
+
+def sleep_with_cancel(seconds: float) -> bool:
+	"""
+	Sleep up to `seconds`; wake early if SHUTDOWN is set.
+	Returns True if a shutdown was requested during the wait.
+	"""
+	if seconds <= 0:
+		return SHUTDOWN.is_set()
+	end = time.time() + seconds
+	while not SHUTDOWN.is_set():
+		remaining = end - time.time()
+		if remaining <= 0:
+			break
+		SHUTDOWN.wait(min(remaining, 0.5))  # short slices keep UI responsive
+	return SHUTDOWN.is_set()
+
+def posix_sleep_with_optional_enter(seconds: float, msg: str) -> bool:
+	"""
+	POSIX-only: sleep up to `seconds`, but if stdin is a TTY, allow Enter to skip.
+	Returns True if a shutdown was requested during the wait, False otherwise.
+	"""
+	if seconds <= 0:
+		return SHUTDOWN.is_set()
+
+	# If not interactive, just do a cancellable sleep with no hint.
+	if not sys.stdin.isatty():
+		return sleep_with_cancel(seconds)
+
+	# Interactive TTY: show a hint and allow Enter to skip via select()
+	print(f"{msg} (Press Enter to skip)")
+	end = time.time() + seconds
+	while not SHUTDOWN.is_set():
+		remaining = end - time.time()
+		if remaining <= 0:
+			break
+		# Wait up to 0.5s slices, or the remaining time, whichever is smaller
+		timeout = min(0.5, max(0.0, remaining))
+		r, _, _ = select.select([sys.stdin], [], [], timeout)
+		if r:
+			try:
+				# Consume the line and treat it as "skip"
+				sys.stdin.readline()
+			except Exception:
+				pass
+			print("[SAFE] Skip requested.")
+			break
+	return SHUTDOWN.is_set()
 
 # --- Caption normalization helpers ---
 def _mojibake_candidate(s: str) -> bool:
@@ -79,18 +152,6 @@ class LoginRequiredError(Exception): pass
 
 # --- Rate limit configuration ---
 RATE_LIMIT_SCHEDULE = [75, 150, 300, 600, 1200, 2400, 4800]  # seconds
-
-
-def jitter_delay(base_seconds: int | float) -> int:
-    """
-    Return base_seconds jittered by ±20% (uniform in [0.8, 1.2]).
-    Clamped to at least 1 second; rounds to int.
-    """
-    if base_seconds <= 0:
-        return 0
-    factor = random.uniform(0.8, 1.2)
-    delay = int(round(base_seconds * factor))
-    return max(delay, 1)
 
 def parse_bool(s: str, default: bool) -> bool:
 	if s is None: return default
@@ -148,66 +209,6 @@ def resolve_profile_and_cookie(config):
 	profile_dir = normalize_profile_dir(config.get("PROFILE_DIR"))
 	cookie_file = COOKIE_FILE
 	return profile_dir, cookie_file
-
-
-# --- Logging globals ---
-RUN_LOG_DIR = None
-RUN_LOG_PATH = None
-FAIL_LOG_PATH = None
-
-
-def resolve_log_dir(config: dict) -> str:
-	"""
-	Return absolute path for LOG_DIRECTORY. If not set, default to ./logs.
-	Creates the directory if it doesn't exist.
-	"""
-	default_logs = os.path.join(os.getcwd(), "logs")
-	log_dir = get_cfg_str(config, "LOG_DIRECTORY", default_logs)
-	log_dir = os.path.abspath(log_dir)
-	os.makedirs(log_dir, exist_ok=True)
-	return log_dir
-
-
-def _install_run_logger(log_dir: str) -> str:
-	"""
-	Mirror all stdout/stderr to a single per-run file under log_dir.
-	Returns the path to the run log file.
-	"""
-	os.makedirs(log_dir, exist_ok=True)
-	ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-	path = os.path.join(log_dir, f"run-{ts}.log")
-	f = open(path, "a", encoding="utf-8", buffering=1)
-
-	class _Tee:
-		def __init__(self, stream):
-			self.stream = stream
-		def write(self, s):
-			try:
-				self.stream.write(s)
-			finally:
-				f.write(s)
-		def flush(self):
-			try:
-				self.stream.flush()
-			finally:
-				f.flush()
-
-	sys.stdout = _Tee(sys.stdout)
-	sys.stderr = _Tee(sys.stderr)
-	atexit.register(lambda: (f.flush(), f.close()))
-	print(f"[LOG] Writing this run to: {path}")
-	return path
-
-
-def log_total_failure(msg: str):
-	global FAIL_LOG_PATH, RUN_LOG_DIR
-	if not FAIL_LOG_PATH:
-		# fallback if called before main() (shouldn't happen, but safe)
-		RUN_LOG_DIR = RUN_LOG_DIR or os.path.join(os.getcwd(), "logs")
-		os.makedirs(RUN_LOG_DIR, exist_ok=True)
-		FAIL_LOG_PATH = os.path.join(RUN_LOG_DIR, "total_failures.log")
-	with open(FAIL_LOG_PATH, "a", encoding="utf-8") as fh:
-		fh.write(msg.rstrip() + "\n")
 
 # --- New: Profile dump scan logic ---
 PROFILE_POSTS_PATH = os.path.join('your_instagram_activity', 'media', 'posts_1.json')
@@ -330,32 +331,45 @@ class SafetyPacer:
                 sleeps.append(self.hour_q[0] + 3600 - now)
             if not self._unlimited(self.day_cap) and len(self.day_q) >= self.day_cap:
                 sleeps.append(self.day_q[0] + 86400 - now)
-            time.sleep(max(1, int(max(sleeps))))
+            sleep_time = max(1, int(max(sleeps)))
+            if sleep_with_cancel(sleep_time):
+                return
 
     def before_download(self):
         self.wait_caps()
         delay = random.uniform(self.min_delay, self.max_delay)
         if self.max_delay > 0:
-            print(f"[SAFE] Sleeping {int(delay)}s before download... (Press Enter to skip)")
-            # Use a shorter sleep interval to check for user input
-            remaining = delay
-            while remaining > 0:
-                sleep_interval = min(1.0, remaining)  # Check every second or remaining time
-                time.sleep(sleep_interval)
-                remaining -= sleep_interval
-                
-                # Check if user pressed Enter (non-blocking input check)
-                try:
-                    import msvcrt
+            if os.name == 'nt':
+                # Windows: non-blocking Enter via msvcrt, still honor shutdown
+                print(f"[SAFE] Sleeping {int(delay)}s before download... (Press Enter to skip)")
+                import msvcrt
+                start = time.time()
+                while True:
+                    remaining = delay - (time.time() - start)
+                    if remaining <= 0:
+                        break
+                    if SHUTDOWN.is_set():
+                        return False
                     if msvcrt.kbhit():
                         key = msvcrt.getch()
-                        if key == b'\r':  # Enter key
+                        if key in (b'\r', b'\n'):
                             print("[SAFE] Break skipped by user")
                             break
-                except ImportError:
-                    # On non-Windows systems, we can't do non-blocking input easily
-                    # Just continue with the sleep
-                    pass
+                    SHUTDOWN.wait(0.05)
+            else:
+                # POSIX branch
+                if sys.stdin.isatty():
+                    # Interactive TTY: real non-blocking Enter-to-skip
+                    if posix_sleep_with_optional_enter(
+                        delay, f"[SAFE] Sleeping {int(delay)}s before download..."
+                    ):
+                        return False  # shutdown
+                else:
+                    # Non-interactive (e.g., piped/cron): no hint, cancellable sleep
+                    print(f"[SAFE] Sleeping {int(delay)}s before download...")
+                    if sleep_with_cancel(delay):
+                        return False
+        return True
 
     def after_success(self):
         now = time.time()
@@ -367,26 +381,33 @@ class SafetyPacer:
         if self.every > 0 and (self.success_count % self.every == 0):
             long_break = random.uniform(self.long_min, self.long_max)
             if self.long_max > 0:
-                print(f"[SAFE] Long break: {int(long_break)}s (Press Enter to skip)")
-                # Use a shorter sleep interval to check for user input
-                remaining = long_break
-                while remaining > 0:
-                    sleep_interval = min(1.0, remaining)  # Check every second or remaining time
-                    time.sleep(sleep_interval)
-                    remaining -= sleep_interval
-                    
-                    # Check if user pressed Enter (non-blocking input check)
-                    try:
-                        import msvcrt
+                if os.name == 'nt':
+                    # Windows: non-blocking Enter via msvcrt, still honor shutdown
+                    print(f"[SAFE] Long break: {int(long_break)}s (Press Enter to skip)")
+                    import msvcrt
+                    start = time.time()
+                    while True:
+                        remaining = long_break - (time.time() - start)
+                        if remaining <= 0:
+                            break
+                        if SHUTDOWN.is_set():
+                            return
                         if msvcrt.kbhit():
                             key = msvcrt.getch()
-                            if key == b'\r':  # Enter key
+                            if key in (b'\r', b'\n'):
                                 print("[SAFE] Long break skipped by user")
                                 break
-                    except ImportError:
-                        # On non-Windows systems, we can't do non-blocking input easily
-                        # Just continue with the sleep
-                        pass
+                        SHUTDOWN.wait(0.05)
+                else:
+                    if sys.stdin.isatty():
+                        if posix_sleep_with_optional_enter(
+                            long_break, f"[SAFE] Long break: {int(long_break)}s"
+                        ):
+                            return  # shutdown requested; caller will notice via SHUTDOWN
+                    else:
+                        print(f"[SAFE] Long break: {int(long_break)}s")
+                        if sleep_with_cancel(long_break):
+                            return
 
 # Helper to check if a file exists and is non-empty
 def file_exists_nonempty(path):
@@ -499,7 +520,8 @@ def manual_login_and_export_cookies(profile_dir: str, cookie_file: str) -> bool:
 		input("\n[Manual Login] ⚠️  When your feed/profile is visible, press ENTER here... ")
 
 		driver.get("https://www.instagram.com/")
-		time.sleep(2)
+		if sleep_with_cancel(2):
+			return False
 
 		save_cookies_netscape(driver, cookie_file)
 		print(f"[Manual Login] Cookies exported → {cookie_file}")
@@ -529,7 +551,8 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 		except:
 			pass
 		
-		time.sleep(2)
+		if sleep_with_cancel(2):
+			return False
 		
 		username = config.get('USERNAME')
 		password = config.get('PASSWORD')
@@ -545,7 +568,8 @@ def automated_login_and_export_cookies(config, profile_dir: str, cookie_file: st
 		password_field.clear()
 		password_field.send_keys(password)
 		password_field.submit()
-		time.sleep(4)
+		if sleep_with_cancel(4):
+			return False
 		
 		if 'login' not in driver.current_url.lower():
 			print('[Auto Login] Login successful, saving cookies!')
@@ -1032,6 +1056,16 @@ def ensure_unique_dir(base_dir: str, name: str) -> str:
 			return cand
 		i += 1
 
+def ensure_thread_dir(base_dir: str, name: str) -> str:
+	"""
+	Create a stable subfolder of base_dir using a sanitized name.
+	Reuses existing folder if it exists (no suffixes).
+	"""
+	safe = sanitize_filename(name) or "thread"
+	path = os.path.join(base_dir, safe)
+	os.makedirs(path, exist_ok=True)
+	return path
+
 def _shortcode_from_share_link(url: str) -> str | None:
 	if not url: return None
 	try:
@@ -1177,9 +1211,10 @@ def download_post(conn, post_data, download_dir, pacer=None):
 		print(f"[SKIPPED] {shortcode} already recorded")
 		return True
 	
-	# Safety pacing before download
+	# Safety pacing before download; honor cancel
 	if pacer:
-		pacer.before_download()
+		if not pacer.before_download() or SHUTDOWN.is_set():
+			return False
     
 	# Generate filename
 	filename_template = generate_filename(post_data)
@@ -1326,11 +1361,12 @@ def download_post(conn, post_data, download_dir, pacer=None):
 	try:
 		from datetime import datetime
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-		failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}"
+		failure_log_entry = f"[{timestamp}] {shortcode} - {error_msg} - URL: {url}\n"
 		
-		log_total_failure(failure_log_entry)
+		with open("total_failures.log", "a", encoding="utf-8") as f:
+			f.write(failure_log_entry)
 		
-		print(f"[DEBUG] Total failure logged to {FAIL_LOG_PATH}")
+		print(f"[DEBUG] Total failure logged to total_failures.log")
 	except Exception as e:
 		print(f"[DEBUG] Failed to log to file: {e}")
 	
@@ -1418,7 +1454,8 @@ def get_profile_post_urls(username):
                 print(f"[PROFILE] Post grid not found, trying to scroll for @{username}")
             
             # Scroll down to load more posts
-            time.sleep(3)
+            if sleep_with_cancel(3):
+                return [], {}
             
             # Scroll down to load all posts and collect URLs during scrolling
             previous_height = driver.execute_script("return document.body.scrollHeight")
@@ -1437,7 +1474,8 @@ def get_profile_post_urls(username):
                 
                 # Scroll down
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                if sleep_with_cancel(2):
+                    return [], {}
                 
                 # Check if new content loaded
                 new_height = driver.execute_script("return document.body.scrollHeight")
@@ -1456,7 +1494,8 @@ def get_profile_post_urls(username):
             all_post_data.update(final_post_data)
             
             # Wait a bit more for posts to load
-            time.sleep(3)
+            if sleep_with_cancel(3):
+                return [], {}
             
             # Get page source
             content = driver.page_source
@@ -1550,6 +1589,8 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
         skipped_count = 0
         
         for i, post_url in enumerate(post_urls, 1):
+            if SHUTDOWN.is_set():
+                break
             print(f"[PROFILE] Downloading post {i}/{len(post_urls)}: {post_url}")
             
             # Extract shortcode from URL
@@ -1598,24 +1639,16 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                     print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
-                        base = RATE_LIMIT_SCHEDULE[
-                            min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
-                        ]
-                        delay = jitter_delay(base)
-                        print(f"[BLOCK] Auto-retrying this item in {base}s → jittered {delay}s...")
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
                     if retry_count > 0:  # delayed retry mode
-                        base = RATE_LIMIT_SCHEDULE[
-                            min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
-                        ]
-                        delay = jitter_delay(base)
-                        print(
-                            f"[BLOCK] Delayed retry mode: sleeping {base}s → jittered {delay}s before retry..."
-                        )
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
@@ -1765,7 +1798,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         thread_name = os.path.basename(os.path.dirname(msg_file))
         print(f"\nProcessing {thread_name}...")
         
-        thread_dir = ensure_unique_dir(dm_download_dir, thread_name)
+        thread_dir = ensure_thread_dir(dm_download_dir, thread_name)
         print(f"[DM] Saving this conversation to: {thread_dir}")
         
         # Gather all message parts for this DM thread
@@ -1843,6 +1876,8 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
         
         # Download the collected posts for this thread into the per-thread folder
         for i, post in enumerate(posts, 1):
+            if SHUTDOWN.is_set():
+                break
             print(f"Downloading post {i}/{len(posts)}: {post['shortcode']}")
             
             # Add send message flag to post data
@@ -1862,24 +1897,16 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                     print("[Advice] Waiting ~30–60 minutes is safest before retrying to avoid repeated blocks.")
                     auto_retry = parse_bool(safety_config.get('AUTO_RETRY_ON_RATE_LIMIT'), True) if safety_config else True
                     if auto_retry:
-                        base = RATE_LIMIT_SCHEDULE[
-                            min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
-                        ]
-                        delay = jitter_delay(base)
-                        print(f"[BLOCK] Auto-retrying this item in {base}s → jittered {delay}s...")
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Auto-retrying this item in {delay}s...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
                         continue
                     # interactive mode
                     if retry_count > 0:  # delayed retry mode
-                        base = RATE_LIMIT_SCHEDULE[
-                            min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)
-                        ]
-                        delay = jitter_delay(base)
-                        print(
-                            f"[BLOCK] Delayed retry mode: sleeping {base}s → jittered {delay}s before retry..."
-                        )
+                        delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE)-1)]
+                        print(f"[BLOCK] Delayed retry mode: sleeping {delay}s before retry...")
                         if sleep_with_cancel(delay):
                             return False  # Shutdown requested
                         retry_count += 1
@@ -1933,9 +1960,10 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None):
                             print("[BLOCK] Manual login failed, retrying anyway...")
                     # else retry immediately
     
-    print(f"\nDM download complete!")
-    print(f"Total posts downloaded: {total_posts}")
-    print(f"Total profiles processed: {total_profiles}")
+    if not SHUTDOWN.is_set():
+        print(f"\nDM download complete!")
+        print(f"Total posts downloaded: {total_posts}")
+        print(f"Total profiles processed: {total_profiles}")
     
     return True
 
@@ -1953,13 +1981,6 @@ def read_config():
                 key, value = line.split('=', 1)
                 config[key.strip()] = value.strip()
     return config
-
-
-def get_cfg_str(cfg: dict, key: str, default: str) -> str:
-    val = cfg.get(key)
-    if val is None:
-        return default
-    return str(val).strip() or default
 
 
 
@@ -2161,14 +2182,8 @@ def settings_menu():
 def main():
     config = read_config()
     
-    # Resolve log directory, install run logger
-    global RUN_LOG_DIR, RUN_LOG_PATH, FAIL_LOG_PATH
-    RUN_LOG_DIR = resolve_log_dir(config)
-    RUN_LOG_PATH = _install_run_logger(RUN_LOG_DIR)
-    FAIL_LOG_PATH = os.path.join(RUN_LOG_DIR, "total_failures.log")
-    
-    # (optional) echo where failures will be recorded
-    print(f"[LOG] Failures will append to: {FAIL_LOG_PATH}")
+    # Install signal handlers early
+    install_signal_handlers()
     
     # Initialize SQLite database
     db_path = os.path.join(os.path.dirname(__file__), 'downloaded_posts.db')
@@ -2291,12 +2306,6 @@ def main():
     finally:
         # Clean exit - close database connection
         close_db(conn)
-        
-        # Print log paths at the end
-        if RUN_LOG_PATH:
-            print(f"[LOG] Full run log: {RUN_LOG_PATH}")
-        if FAIL_LOG_PATH and os.path.exists(FAIL_LOG_PATH):
-            print(f"[LOG] Failures file: {FAIL_LOG_PATH}")
 
 if __name__ == "__main__":
     main() 
