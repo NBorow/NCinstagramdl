@@ -302,6 +302,10 @@ SAVED_COLLECTIONS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved
 SAVED_POSTS_PATH = os.path.join('your_instagram_activity', 'saved', 'saved_posts.json')
 DM_INBOX_PATH = os.path.join('your_instagram_activity', 'messages', 'inbox')
 
+# Target base subfolder for saved downloads
+SAVED_BASE_SUBDIR = "saved"
+UNSORTED_COLLECTION_DIRNAME = "_unsorted"
+
 # --- Safety Settings ---
 SAFETY_KEYS = [
     'MIN_DELAY_SECONDS',
@@ -1169,6 +1173,105 @@ def parse_liked_posts_json(liked_json_path: str) -> list[dict]:
 
 	return posts
 
+def parse_saved_posts_json(saved_json_path: str) -> list[dict]:
+	"""
+	Parse 'your_instagram_activity/saved/saved_posts.json'.
+	Returns a list of unified post dicts (no collection, goes to _unsorted).
+	Shape example (per export):
+	  saved_saved_media[*].string_map_data["Saved on"].{href, timestamp}
+	  title == username (may be absent sometimes)
+	"""
+	posts: list[dict] = []
+	if not file_exists_nonempty(saved_json_path):
+		return posts
+	try:
+		with open(saved_json_path, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		items = data.get("saved_saved_media") or []
+		seen = set()
+		for it in items:
+			smd = (it.get("string_map_data") or {})
+			saved = (smd.get("Saved on") or {})
+			href = (saved.get("href") or "").strip()
+			ts = saved.get("timestamp") or 0
+			shortcode = extract_shortcode_from_url(href)
+			if not shortcode or shortcode in seen:
+				continue
+			seen.add(shortcode)
+			posts.append({
+				"shortcode": shortcode,
+				"url": href,
+				"original_owner": None,     # filled by sidecar after download
+				"username": it.get("title"),# may be None in some exports
+				"description": "",
+				"timestamp_ms": int(ts) * 1000 if ts else 0,
+				"source": "saved",
+				"dm_thread": None,
+				# no collection here → handled by target folder logic
+				"_collection": None,
+			})
+	except Exception as e:
+		print(f"[WARN] Failed to parse saved_posts.json: {e}")
+	return posts
+
+
+def parse_saved_collections_json(saved_collections_json_path: str) -> list[dict]:
+	"""
+	Parse 'your_instagram_activity/saved/saved_collections.json'.
+	The file is run-length encoded by collection:
+	  - A header row marks the collection: {"title":"Collection", string_map_data["Name"].value = <CollectionName>}
+	  - Following rows until the next header are posts in that collection:
+		string_map_data["Name"].href = post link
+		string_map_data["Added Time"].timestamp = when added
+	Returns a list of unified post dicts with an extra key "_collection".
+	"""
+	posts: list[dict] = []
+	if not file_exists_nonempty(saved_collections_json_path):
+		return posts
+	try:
+		with open(saved_collections_json_path, "r", encoding="utf-8") as f:
+			data = json.load(f) or {}
+		items = data.get("saved_saved_collections") or []
+		current_collection = None
+		seen = set()
+
+		for it in items:
+			title = it.get("title")
+			smd = it.get("string_map_data") or {}
+
+			# Header row: defines current collection
+			if title == "Collection" and "Name" in smd and "value" in (smd.get("Name") or {}):
+				current_collection = (smd.get("Name") or {}).get("value")
+				continue
+
+			# Item row: belongs to current_collection
+			name_map = smd.get("Name") or {}
+			href = (name_map.get("href") or "").strip()
+			if not href:
+				# Some exports might not set href on header rows or malformed rows
+				continue
+			ts = (smd.get("Added Time") or {}).get("timestamp") or 0
+
+			shortcode = extract_shortcode_from_url(href)
+			if not shortcode or shortcode in seen:
+				continue
+			seen.add(shortcode)
+
+			posts.append({
+				"shortcode": shortcode,
+				"url": href,
+				"original_owner": None,
+				"username": name_map.get("value"),  # often the IG handle shown next to href
+				"description": "",
+				"timestamp_ms": int(ts) * 1000 if ts else 0,
+				"source": "saved",
+				"dm_thread": None,
+				"_collection": current_collection,  # may be None if header missing
+			})
+	except Exception as e:
+		print(f"[WARN] Failed to parse saved_collections.json: {e}")
+	return posts
+
 def ensure_unique_dir(base_dir: str, name: str) -> str:
 	"""
 	Create a unique subfolder of base_dir using a sanitized name.
@@ -1197,6 +1300,18 @@ def ensure_thread_dir(base_dir: str, name: str) -> str:
 	path = os.path.join(base_dir, safe)
 	os.makedirs(path, exist_ok=True)
 	return path
+
+def sanitize_collection_name(name: str) -> str:
+    # Conservative sanitize for filesystem
+    bad = '<>:"/\\|?*'
+    out = "".join(ch for ch in (name or "").strip() if ch not in bad)
+    return out if out else UNSORTED_COLLECTION_DIRNAME
+
+def ensure_collection_dir(base_download_dir: str, collection_name: str) -> str:
+    c = sanitize_collection_name(collection_name)
+    path = os.path.join(base_download_dir, SAVED_BASE_SUBDIR, c)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 def _shortcode_from_share_link(url: str) -> str | None:
 	if not url: return None
@@ -2213,6 +2328,100 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 	print("Liked posts processing complete.")
 	return True
 
+def process_saved_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
+	"""
+	Process Saved posts found inside a profile export dump.
+	- Parse saved_posts.json and saved_collections.json
+	- De-dupe by shortcode
+	- Download into per-collection folders under downloads/saved/<CollectionName>
+	"""
+	from db import is_downloaded, record_failure  # keep local import style if used elsewhere
+
+	saved_posts_json = os.path.join(dump_path, SAVED_POSTS_PATH)
+	saved_cols_json  = os.path.join(dump_path, SAVED_COLLECTIONS_PATH)
+
+	unsorted_posts = parse_saved_posts_json(saved_posts_json)
+	collected_posts = parse_saved_collections_json(saved_cols_json)
+
+	all_posts = []
+	seen = set()
+	for p in (unsorted_posts + collected_posts):
+		sc = p.get("shortcode")
+		if sc and sc not in seen:
+			seen.add(sc)
+			all_posts.append(p)
+
+	if not all_posts:
+		print("No saved posts found.")
+		return True
+
+	download_base_dir = config.get("DOWNLOAD_DIRECTORY", os.path.join(os.path.dirname(__file__), "downloads"))
+
+	for i, post in enumerate(all_posts, 1):
+		if SHUTDOWN.is_set():
+			print("[STOP] Cancelled by user.")
+			break
+
+		shortcode = post["shortcode"]
+		# Skip re-downloads if any source already succeeded for this shortcode
+		if is_downloaded(conn, shortcode):
+			print(f"[SKIP] Already downloaded {shortcode}")
+			continue
+
+		# Resolve target dir per collection
+		collection_name = post.get("_collection") or UNSORTED_COLLECTION_DIRNAME
+		target_dir = ensure_collection_dir(download_base_dir, collection_name)
+
+		retry_count = 0
+		while True:
+			try:
+				ok = download_post(conn, post, target_dir, pacer, config)
+				if ok and pacer:
+					pacer.after_success()
+				break
+
+			except RateLimitError:
+				SESSION_TRACKER.record_rate_limit()
+				base_delay = RATE_LIMIT_SCHEDULE[min(retry_count, len(RATE_LIMIT_SCHEDULE) - 1)]
+				delay = get_jittered_delay(base_delay)
+				print(f"[BLOCK] Rate limited. Retrying in {delay}s.")
+				if sleep_with_cancel(delay):
+					return False
+				retry_count += 1
+
+			except CheckpointError:
+				print("[BLOCK] Checkpoint/challenge. Use manual login then retry.")
+				resp = input("[Enter]=retry  |  M=manual login  |  S=skip  |  Q=quit > ").strip().lower()
+				if resp == "q": return False
+				if resp == "s":
+					record_failure(conn, post, "Skipped during checkpoint")
+					break
+				if resp == "m":
+					# Re-run your existing manual-login path
+					config = read_config()
+					profile_dir, cookie_file = resolve_profile_and_cookie(config)
+					manual_login_and_export_cookies(profile_dir, cookie_file)
+				# else retry
+
+			except LoginRequiredError:
+				print("[BLOCK] Login required. Revalidate cookies.")
+				resp = input("[M]=manual login  |  R=retry  |  S=skip  |  Q=quit > ").strip().lower()
+				if resp == "q": return False
+				if resp == "s":
+					record_failure(conn, post, "Skipped after login-required")
+					break
+				if resp == "m":
+					config = read_config()
+					profile_dir, cookie_file = resolve_profile_and_cookie(config)
+					manual_login_and_export_cookies(profile_dir, cookie_file)
+
+			except NotFoundError:
+				print(f"[SKIP] Unavailable/deleted/private: {shortcode}")
+				record_failure(conn, post, "Deleted/private/unavailable")
+				SESSION_TRACKER.record_download_skip()
+				break
+	return True
+
 def read_config():
     config = {}
     if not os.path.exists(CONFIG_FILE):
@@ -2549,9 +2758,20 @@ def main():
                                         input("Press Enter to return to main menu...")
                                         break
                                 elif "Saved Posts Download" in selected_option:
-                                    print("Saved posts download not yet implemented")
-                                    input("Press Enter to return to main menu...")
-                                    break
+                                    result = process_saved_for_dump(conn, selected_path, pacer, safety_config, config)
+                                    if result is True:
+                                        print("\nDownload Statistics:")
+                                        stats = get_download_stats(conn)
+                                        for key, value in stats.items():
+                                            print(f"  {key}: {value}")
+                                        input("Press Enter to return to main menu...")
+                                        break
+                                    elif result is False:
+                                        return
+                                    else:
+                                        print("No saved posts to process.")
+                                        input("Press Enter to return to main menu...")
+                                        break
                             else:
                                 print(f"Invalid option. Please enter a number between 1 and {len(options)}, 'b', or 'q'.")
                         else:
