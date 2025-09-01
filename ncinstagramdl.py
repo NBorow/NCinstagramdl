@@ -1122,6 +1122,55 @@ def extract_shortcode_from_url(url):
     
     return None
 
+def parse_liked_posts_json(liked_json_path: str) -> list[dict]:
+	"""
+	Parse Instagram 'liked_posts.json' (your_instagram_activity/likes/liked_posts.json).
+	Returns a list of unified post dicts expected by download_post(...).
+	"""
+	posts: list[dict] = []
+	if not file_exists_nonempty(liked_json_path):
+		return posts
+
+	try:
+		with open(liked_json_path, 'r', encoding='utf-8') as f:
+			data = json.load(f) or {}
+
+		items = (data.get('likes_media_likes') or [])
+		seen = set()
+
+		for it in items:
+			title = (it.get('title') or '').strip()
+			sld = (it.get('string_list_data') or [])
+			if not sld:
+				continue
+			entry = sld[0] or {}
+			href = (entry.get('href') or '').strip()
+			ts = entry.get('timestamp') or 0
+
+			shortcode = extract_shortcode_from_url(href)
+			if not shortcode:
+				continue
+			if shortcode in seen:
+				continue
+			seen.add(shortcode)
+
+			posts.append({
+				'shortcode': shortcode,
+				'url': href,
+				'original_owner': title,
+				'username': title,
+				'caption_raw': None,
+				'caption': None,
+				'description': '',
+				'timestamp_ms': int(ts) * 1000 if ts else 0,
+				'source': 'liked',
+				'dm_thread': None,
+			})
+	except Exception as e:
+		print(f"Failed to parse liked posts JSON: {e}")
+
+	return posts
+
 def ensure_unique_dir(base_dir: str, name: str) -> str:
 	"""
 	Create a unique subfolder of base_dir using a sanitized name.
@@ -1321,6 +1370,9 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			'--output', output_path,
 			'--no-check-certificate',
 			'--ignore-errors',
+			'--write-info-json',
+			'--no-simulate',
+			'--no-write-playlist-metafiles',
 			'--print', 'after_move:filepath',   # NEW: print final saved file path
 			url
 		]
@@ -1345,6 +1397,10 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			saved_path = std_lines[-1].strip() if std_lines else None
 			if saved_path and not os.path.isabs(saved_path):
 				saved_path = os.path.abspath(os.path.join(download_dir, saved_path))
+			
+			# Enrich post data from metadata sidecar
+			enrich_post_from_sidecar(post_data, saved_path, tool='yt-dlp', basename=basename, download_dir=download_dir)
+			
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
@@ -1381,6 +1437,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			'--cookies', COOKIE_FILE,
 			'--directory', download_dir,
 			'--filename', gallery_filename,
+			'-o', 'write-metadata=true',
+			'-o', f'metadata-filename={basename}.json',
 			'--exec', 'echo {filepath}',
 			url
 		]
@@ -1422,6 +1480,10 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			
 			if saved_path and not os.path.isabs(saved_path):
 				saved_path = os.path.abspath(os.path.join(download_dir, saved_path))
+			
+			# Enrich post data from metadata sidecar
+			enrich_post_from_sidecar(post_data, saved_path, tool='gallery-dl', basename=basename, download_dir=download_dir)
+			
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
@@ -2077,7 +2139,60 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
         print(f"Total posts downloaded: {total_posts}")
         print(f"Total profiles processed: {total_profiles}")
     
-    return True
+        return True
+
+def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, config: dict):
+	"""
+	Process liked posts inside a specific profile dump directory.
+	- Parse JSON
+	- De-dupe by shortcode (this run)
+	- For each, if not already downloaded anywhere, call download_post(...)
+	"""
+	from db import is_downloaded  # match local-import style used elsewhere
+
+	liked_json = os.path.join(dump_path, LIKED_PATH)
+	if not file_exists_nonempty(liked_json):
+		print("No liked_posts.json found in this dump.")
+		return True  # nothing to do
+
+	posts = parse_liked_posts_json(liked_json)
+	if not posts:
+		print("No liked posts to process.")
+		return True
+
+	target_dir = ensure_thread_dir(dump_path, "LIKED")
+
+	seen = set()
+	filtered = []
+	for p in posts:
+		sc = p.get('shortcode')
+		if sc and sc not in seen:
+			seen.add(sc)
+			filtered.append(p)
+
+	print(f"Found {len(filtered)} liked post(s). Starting downloads...")
+
+	for idx, post in enumerate(filtered, 1):
+		if SHUTDOWN.is_set():
+			print("Shutdown requested. Exiting liked-posts loop.")
+			return False
+
+		shortcode = post.get('shortcode')
+		if not shortcode:
+			continue
+
+		# If any source already downloaded this shortcode, skip silently (no DB write).
+		if is_downloaded(conn, shortcode):
+			print(f"[SKIP] {shortcode} already downloaded")
+			SESSION_TRACKER.record_download_skip()
+			continue
+
+		ok = download_post(conn, post, target_dir, pacer=pacer, config=config)
+		if not ok and SHUTDOWN.is_set():
+			return False
+
+	print("Liked posts processing complete.")
+	return True
 
 def read_config():
     config = {}
@@ -2400,9 +2515,20 @@ def main():
                                     input("Press Enter to return to main menu...")
                                     break
                                 elif "Liked Posts Download" in selected_option:
-                                    print("Liked posts download not yet implemented")
-                                    input("Press Enter to return to main menu...")
-                                    break
+                                    result = process_liked_for_dump(conn, selected_path, pacer, safety_config, config)
+                                    if result is True:
+                                        print("\nDownload Statistics:")
+                                        stats = get_download_stats(conn)
+                                        for key, value in stats.items():
+                                            print(f"  {key}: {value}")
+                                        input("Press Enter to return to main menu...")
+                                        break
+                                    elif result is False:
+                                        return
+                                    else:
+                                        print("No liked posts to process.")
+                                        input("Press Enter to return to main menu...")
+                                        break
                                 elif "Saved Posts Download" in selected_option:
                                     print("Saved posts download not yet implemented")
                                     input("Press Enter to return to main menu...")
@@ -2625,6 +2751,91 @@ def get_cfg_str(cfg: dict, key: str, default: str) -> str:
     if val is None:
         return default
     return str(val).strip() or default
+
+def _try_load_json(path: str):
+	try:
+		with open(path, 'r', encoding='utf-8') as f:
+			return json.load(f)
+	except Exception:
+		return None
+
+def enrich_post_from_sidecar(post_data: dict, saved_path: str, *, tool: str, basename: str, download_dir: str):
+	"""
+	Populate caption/owner/timestamp from a metadata sidecar produced during the SAME download.
+	Then delete the sidecar. No extra network hits.
+	tool: 'yt-dlp' or 'gallery-dl'
+	"""
+	if not saved_path:
+		return
+	info_path = None
+
+	if tool == 'yt-dlp':
+		root, _ext = os.path.splitext(saved_path)
+		cand1 = root + '.info.json'
+		cand2 = saved_path + '.info.json'
+		if os.path.exists(cand1):
+			info_path = cand1
+		elif os.path.exists(cand2):
+			info_path = cand2
+	elif tool == 'gallery-dl':
+		# We set metadata-filename to f"{basename}.json" below
+		cand = os.path.join(download_dir, f"{basename}.json")
+		if os.path.exists(cand):
+			info_path = cand
+
+	if not info_path:
+		return
+
+	info = _try_load_json(info_path)
+	if not info:
+		try:
+			os.remove(info_path)
+		except Exception:
+			pass
+		return
+
+	# Prefer live metadata for clean UTF-8 caption and accurate owner
+	desc = info.get('description') or info.get('content') or None
+	uploader = info.get('uploader') or info.get('uploader_id') or info.get('author') or None
+	web_url = info.get('webpage_url') or info.get('url') or None
+	ts = info.get('timestamp') or info.get('date')  # yt-dlp: epoch; gallery-dl: may be epoch or yyyymmdd
+
+	if isinstance(ts, (int, float)):
+		ts_ms = int(ts) * 1000
+	elif isinstance(ts, str) and ts.isdigit() and len(ts) == 8:
+		# naive yyyymmdd → midnight local; keep as ms for APPEND_POST_DATE if not already set
+		try:
+			dt = datetime.strptime(ts, '%Y%m%d')
+			ts_ms = int(dt.timestamp() * 1000)
+		except Exception:
+			ts_ms = None
+	else:
+		ts_ms = None
+
+	# Only fill if missing/empty
+	if not post_data.get('caption_raw'):
+		post_data['caption_raw'] = desc
+	if not post_data.get('caption'):
+		post_data['caption'] = desc
+	if (not post_data.get('original_owner')) and uploader:
+		post_data['original_owner'] = uploader
+	if (not post_data.get('url')) and web_url:
+		post_data['url'] = web_url
+	
+	# Always override timestamp_ms for liked posts.
+	# If the sidecar has a timestamp, use it; otherwise set None.
+	if post_data.get('source') == 'liked':
+		post_data['timestamp_ms'] = ts_ms if ts_ms is not None else None
+	else:
+		# For other sources, only fill if missing
+		if ts_ms is not None and not post_data.get('timestamp_ms'):
+			post_data['timestamp_ms'] = ts_ms
+
+	# cleanup
+	try:
+		os.remove(info_path)
+	except Exception:
+		pass
 
 if __name__ == "__main__":
     main() 
