@@ -1401,6 +1401,19 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			# Enrich post data from metadata sidecar
 			enrich_post_from_sidecar(post_data, saved_path, tool='yt-dlp', basename=basename, download_dir=download_dir)
 			
+			# NEW: Recompute basename now that caption/timestamp may be set; rename once.
+			if saved_path:
+				new_basename = build_output_basename(post_data, config)
+				if new_basename and new_basename != basename:
+					_root, ext = os.path.splitext(saved_path)
+					dst = os.path.join(download_dir, new_basename + ext)
+					try:
+						if not os.path.exists(dst):
+							os.rename(saved_path, dst)
+							saved_path = dst
+					except Exception:
+						pass
+			
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
 				fname = os.path.basename(saved_path) if saved_path else f"{shortcode}"
@@ -1483,6 +1496,19 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 			
 			# Enrich post data from metadata sidecar
 			enrich_post_from_sidecar(post_data, saved_path, tool='gallery-dl', basename=basename, download_dir=download_dir)
+			
+			# NEW: Recompute basename using sidecar-enriched caption/timestamp; rename once.
+			if saved_path:
+				new_basename = build_output_basename(post_data, config)
+				if new_basename and new_basename != basename:
+					_root, ext = os.path.splitext(saved_path)
+					dst = os.path.join(download_dir, new_basename + ext)
+					try:
+						if not os.path.exists(dst):
+							os.rename(saved_path, dst)
+							saved_path = dst
+					except Exception:
+						pass
 			
 			status = record_download(conn, post_data, saved_path)   # pass path
 			if status == "inserted":
@@ -2160,7 +2186,9 @@ def process_liked_for_dump(conn, dump_path: str, pacer, safety_config: dict, con
 		print("No liked posts to process.")
 		return True
 
-	target_dir = ensure_thread_dir(dump_path, "LIKED")
+	# Get download directory from config
+	download_base_dir = config.get('DOWNLOAD_DIRECTORY', os.path.join(os.path.dirname(__file__), 'downloads'))
+	target_dir = ensure_thread_dir(download_base_dir, "liked")
 
 	seen = set()
 	filtered = []
