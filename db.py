@@ -15,7 +15,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
         sqlite3.Connection: Database connection
     """
     # Ensure the directory exists
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     
     # Connect to database (creates it if it doesn't exist)
     conn = sqlite3.connect(db_path)
@@ -28,8 +30,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
             url TEXT NOT NULL,
             description TEXT,
             original_owner TEXT,
-            caption_raw TEXT,            -- NEW: original as found (DM snapshot or live)
-            caption TEXT,                -- NEW: normalized/cleaned for filenames/search
+            caption TEXT,                -- Clean caption from sidecar metadata
             source TEXT,                 -- e.g., 'dm','saved','liked','profile'
             username TEXT,
             timestamp_ms INTEGER,
@@ -108,7 +109,7 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
     Args:
         conn: Database connection
         post: Dictionary containing post information with keys:
-              shortcode, url, description, original_owner, caption_raw, caption,
+              shortcode, url, description, original_owner, caption,
               source, username, timestamp_ms, status (optional)
         local_path: Optional path to the downloaded file
               
@@ -118,11 +119,11 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
     try:
         conn.execute('''
             INSERT INTO posts (
-                shortcode, url, description, original_owner, caption_raw, caption,
+                shortcode, url, description, original_owner, caption,
                 source, username, timestamp_ms, status, downloaded_at,
                 error_message, dm_thread, local_path
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', CURRENT_TIMESTAMP, NULL, ?, ?)
             ON CONFLICT(shortcode, source) DO UPDATE SET
                 status='success',
                 error_message=NULL,
@@ -130,7 +131,6 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
                 url=excluded.url,
                 description=excluded.description,
                 original_owner=excluded.original_owner,
-                caption_raw=excluded.caption_raw,
                 caption=excluded.caption,
                 username=excluded.username,
                 timestamp_ms=excluded.timestamp_ms,
@@ -141,7 +141,6 @@ def record_download(conn: sqlite3.Connection, post: Dict, local_path: Optional[s
             post.get('url'),
             post.get('description'),
             post.get('original_owner'),
-            post.get('caption_raw'),
             post.get('caption'),
             post.get('source'),
             post.get('username'),
@@ -171,11 +170,11 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
     try:
         conn.execute('''
             INSERT INTO posts (
-                shortcode, url, description, original_owner, caption_raw, caption,
+                shortcode, url, description, original_owner, caption,
                 source, username, timestamp_ms, status, error_message,
                 downloaded_at, dm_thread
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, CURRENT_TIMESTAMP, ?)
             ON CONFLICT(shortcode, source) DO UPDATE SET
                 status='failed',
                 error_message=excluded.error_message,
@@ -183,7 +182,6 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
                 url=excluded.url,
                 description=excluded.description,
                 original_owner=excluded.original_owner,
-                caption_raw=excluded.caption_raw,
                 caption=excluded.caption,
                 username=excluded.username,
                 timestamp_ms=excluded.timestamp_ms,
@@ -193,7 +191,6 @@ def record_failure(conn: sqlite3.Connection, post: Dict, error: str) -> str:
             post.get('url'),
             post.get('description'),
             post.get('original_owner'),
-            post.get('caption_raw'),
             post.get('caption'),
             post.get('source'),
             post.get('username'),
@@ -254,35 +251,15 @@ def close_db(conn: sqlite3.Connection):
 
 
 def get_recent_download_timestamps(conn: sqlite3.Connection, since_epoch_seconds: float) -> list:
-    """
-    Return a list of UNIX timestamps (seconds) for successful downloads
-    with created_at >= since_epoch_seconds. If not available, return [].
-    
-    Args:
-        conn: Database connection
-        since_epoch_seconds: Minimum timestamp to include (UNIX seconds)
-        
-    Returns:
-        list: List of UNIX timestamps (seconds) for successful downloads
-    """
     try:
-        # Convert to datetime for SQLite comparison
-        since_datetime = datetime.fromtimestamp(since_epoch_seconds).isoformat()
-        
         cursor = conn.execute('''
-            SELECT downloaded_at FROM posts 
-            WHERE status = 'success' AND downloaded_at >= ?
+            SELECT strftime('%s', downloaded_at)
+            FROM posts
+            WHERE status = 'success'
+              AND strftime('%s', downloaded_at) >= ?
             ORDER BY downloaded_at
-        ''', (since_datetime,))
-        
-        timestamps = []
-        for row in cursor.fetchall():
-            # Convert SQLite datetime to UNIX timestamp
-            dt = datetime.fromisoformat(row[0])
-            timestamps.append(dt.timestamp())
-        
-        return timestamps
-        
+        ''', (int(since_epoch_seconds),))
+        return [float(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
     except Exception as e:
         print(f"Error fetching recent download timestamps: {e}")
         return [] 
