@@ -194,6 +194,9 @@ def build_output_basename(post: dict, config: dict) -> str:
 class RateLimitError(Exception): pass
 class CheckpointError(Exception): pass
 class LoginRequiredError(Exception): pass
+class NotFoundError(Exception):
+    """Media deleted/private/unavailable. Treat as final (no retry)."""
+    pass
 
 # --- Rate limit configuration ---
 RATE_LIMIT_SCHEDULE = [75, 150, 300, 600, 1200, 2400, 4800]  # seconds
@@ -228,7 +231,28 @@ def classify_block_reason(stderr: str):
         return "checkpoint"
     if any(p in s for p in ["login required", "please log in", "not logged in"]):
         return "login_required"
-    if any(p in s for p in ["429", "rate limit", "please wait", "try again later", "temporarily blocked"]):
+    # NEW: explicit not-found/private detection
+    if any(p in s for p in [
+        "instagram sent an empty media response",
+        "not found",
+        "content unavailable",
+        "media missing",
+        "this post is private",
+        "owner has restricted",
+        "404",
+        "410"
+    ]):
+        return "not_found"
+    # Existing rate-limit markers
+    if any(p in s for p in [
+        "429",
+        "rate limit",
+        "please wait",
+        "try again later",
+        "temporarily blocked",
+        "requested content is not available, rate-limit reached or login required",
+        "instagram api is not granting access"
+    ]):
         return "rate_limit"
     return None
 
@@ -1312,6 +1336,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				raise CheckpointError(result.stderr or "checkpoint")
 			elif reason == "login_required":
 				raise LoginRequiredError(result.stderr or "login required")
+			elif reason == "not_found":
+				raise NotFoundError(result.stderr or "not found/private")
 		
 		if result.returncode == 0:
 			# extract final path from stdout (last non-empty line)
@@ -1370,6 +1396,8 @@ def download_post(conn, post_data, download_dir, pacer=None, config=None):
 				raise CheckpointError(result.stderr or "checkpoint")
 			elif reason == "login_required":
 				raise LoginRequiredError(result.stderr or "login required")
+			elif reason == "not_found":
+				raise NotFoundError(result.stderr or "not found/private")
 		
 		if result.returncode == 0:
 			# collect all absolute-looking paths gallery-dl printed
@@ -1775,6 +1803,11 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
                         else:
                             print("[BLOCK] Manual login failed, retrying anyway...")
                     # else retry immediately
+                except NotFoundError as e:
+                    print(f"[SKIP] Post unavailable/deleted/private: {shortcode}")
+                    record_failure(conn, post_data_dict, "Deleted/private/unavailable")
+                    SESSION_TRACKER.record_download_skip()
+                    break
             
 
         
@@ -2033,6 +2066,11 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                         else:
                             print("[BLOCK] Manual login failed, retrying anyway...")
                     # else retry immediately
+                except NotFoundError as e:
+                    print(f"[SKIP] Post unavailable/deleted/private: {post['shortcode']}")
+                    record_failure(conn, post, "Deleted/private/unavailable")
+                    SESSION_TRACKER.record_download_skip()
+                    break
     
     if not SHUTDOWN.is_set():
         print(f"\nDM download complete!")
