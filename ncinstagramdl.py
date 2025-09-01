@@ -1159,8 +1159,6 @@ def parse_liked_posts_json(liked_json_path: str) -> list[dict]:
 				'url': href,
 				'original_owner': title,
 				'username': title,
-				'caption_raw': None,
-				'caption': None,
 				'description': '',
 				'timestamp_ms': int(ts) * 1000 if ts else 0,
 				'source': 'liked',
@@ -1301,13 +1299,11 @@ def extract_dm_posts_and_profiles(dm_json_path, thread_name=None):
                         break
             
             # Create post data
-            raw = (share_data['share_text'] or '').strip() or None
             post_data = {
                 'shortcode': share_data['shortcode'],
                 'url': share_data['url'],
                 'original_owner': share_data['original_owner'],
-                'caption_raw': raw,
-                'caption': normalize_caption_text(raw) if raw else None,
+                # do not set caption here; sidecar will populate it
                 'timestamp_ms': share_data['timestamp_ms'],
                 'source': 'dm',
                 'dm_thread': thread_name,
@@ -1795,13 +1791,10 @@ def download_profile_posts(conn, username, download_dir, source='dm_profile', pa
             post_caption = post_data.get(post_url, "")
             
             # Create post data structure
-            raw = (post_caption or '').strip() or None
             post_data_dict = {
                 'shortcode': shortcode,
                 'url': post_url,
                 'original_owner': username,
-                'caption_raw': raw,
-                'caption': normalize_caption_text(raw) if raw else None,
                 'timestamp_ms': int(time.time() * 1000),
                 'source': source,
                 'dm_thread': thread_name,
@@ -2030,7 +2023,6 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
             ts = m.get("timestamp_ms")
             sender = (m.get("sender_name") or "").strip()
             orig_owner = (share.get("original_content_owner") or "").strip() or None
-            caption_raw = (share.get("share_text") or "").strip() or None
 
             # Pair a send message if next is same sender and within <1s
             send_text = None
@@ -2048,8 +2040,7 @@ def process_dm_download(conn, selected_path, pacer=None, safety_config=None, con
                 'url': link,
                 'description': None,
                 'original_owner': orig_owner,
-                'caption_raw': caption_raw,
-                'caption': normalize_caption_text(caption_raw) if caption_raw else None,
+                # do not set caption here; sidecar will populate it
                 'source': 'dm',
                 'username': orig_owner,
                 'timestamp_ms': ts,
@@ -2840,11 +2831,14 @@ def enrich_post_from_sidecar(post_data: dict, saved_path: str, *, tool: str, bas
 	else:
 		ts_ms = None
 
-	# Only fill if missing/empty
-	if not post_data.get('caption_raw'):
-		post_data['caption_raw'] = desc
-	if not post_data.get('caption'):
+	# -- caption: always use sidecar when present (clean UTF-8), and stop using caption_raw
+	if desc:
 		post_data['caption'] = desc
+		if 'caption_raw' in post_data:
+			try:
+				del post_data['caption_raw']
+			except Exception:
+				pass
 	if (not post_data.get('original_owner')) and uploader:
 		post_data['original_owner'] = uploader
 	if (not post_data.get('url')) and web_url:
