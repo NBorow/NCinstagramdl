@@ -159,7 +159,10 @@ def build_output_basename(post: dict, config: dict) -> str:
     filesystem limits even when yt-dlp/gallery-dl append transient suffixes.
     """
     shortcode = (post.get("shortcode") or "unknown").strip()
-    owner = (post.get("original_owner") or "unknown").strip()
+    owner_raw = (post.get("original_owner") or post.get("username") or "").strip()
+    owner = clean_text_for_filename(owner_raw) or "unknown"
+    # Optional one-liner debug:
+    # print(f"[DEBUG] Owner before/after sanitize: {owner_raw!r} -> {owner!r}")
     caption = clean_text_for_filename(post.get("caption") or "")
     
     # Compose prefix: optional date + shortcode + owner
@@ -3033,9 +3036,43 @@ def enrich_post_from_sidecar(post_data: dict, saved_path: str, *, tool: str, bas
 			pass
 		return
 
+	# TESTING: Print out only owner/poster related info
+	print(f"\n[DEBUG] Sidecar owner info for {post_data.get('shortcode', 'unknown')}:")
+	print(f"[DEBUG] Tool: {tool}")
+	
+	# Extract and display only owner/poster related fields
+	owner_fields = {}
+	owner_keys = ['uploader', 'uploader_id', 'author', 'channel', 'creator', 'artist']
+	
+	for key in owner_keys:
+		if key in info and info[key]:
+			owner_fields[key] = info[key]
+	
+	if owner_fields:
+		print(f"[DEBUG] Owner fields found:")
+		for key, value in owner_fields.items():
+			print(f"[DEBUG]   {key}: {value}")
+	else:
+		print(f"[DEBUG] No owner fields found in sidecar")
+	
+	# Also show description/caption if available (often contains username mentions)
+	desc = info.get('description') or info.get('content') or None
+	if desc:
+		print(f"[DEBUG] Description preview: {desc[:100]}{'...' if len(desc) > 100 else ''}")
+	
+	print("[DEBUG] End of owner info\n")
+
 	# Prefer live metadata for clean UTF-8 caption and accurate owner
 	desc = info.get('description') or info.get('content') or None
-	uploader = info.get('uploader') or info.get('uploader_id') or info.get('author') or None
+	uploader = (
+		info.get('uploader')
+		or info.get('uploader_id')
+		or info.get('author')
+		or info.get('channel')   # sometimes present for IG extractors
+		or info.get('creator')   # rare, but seen in some extractors
+		or info.get('artist')    # very rare
+		or None
+	)
 	web_url = info.get('webpage_url') or info.get('url') or None
 	ts = info.get('timestamp') or info.get('date')  # yt-dlp: epoch; gallery-dl: may be epoch or yyyymmdd
 
