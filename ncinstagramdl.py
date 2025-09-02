@@ -3036,31 +3036,7 @@ def enrich_post_from_sidecar(post_data: dict, saved_path: str, *, tool: str, bas
 			pass
 		return
 
-	# TESTING: Print out only owner/poster related info
-	print(f"\n[DEBUG] Sidecar owner info for {post_data.get('shortcode', 'unknown')}:")
-	print(f"[DEBUG] Tool: {tool}")
-	
-	# Extract and display only owner/poster related fields
-	owner_fields = {}
-	owner_keys = ['uploader', 'uploader_id', 'author', 'channel', 'creator', 'artist']
-	
-	for key in owner_keys:
-		if key in info and info[key]:
-			owner_fields[key] = info[key]
-	
-	if owner_fields:
-		print(f"[DEBUG] Owner fields found:")
-		for key, value in owner_fields.items():
-			print(f"[DEBUG]   {key}: {value}")
-	else:
-		print(f"[DEBUG] No owner fields found in sidecar")
-	
-	# Also show description/caption if available (often contains username mentions)
-	desc = info.get('description') or info.get('content') or None
-	if desc:
-		print(f"[DEBUG] Description preview: {desc[:100]}{'...' if len(desc) > 100 else ''}")
-	
-	print("[DEBUG] End of owner info\n")
+
 
 	# Prefer live metadata for clean UTF-8 caption and accurate owner
 	desc = info.get('description') or info.get('content') or None
