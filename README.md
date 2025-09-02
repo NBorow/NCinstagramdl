@@ -5,6 +5,8 @@ A menu-driven tool for managing Instagram data exports (“profile dumps”) and
 ## Features
 - Scan and select Instagram **profile dumps** (unzipped exports)
 - **DM download**: browse conversations, fetch shared posts (and optionally shared profiles)
+- **Saved posts download**: download posts from your saved collections and unsorted saved posts
+- **Liked posts download**: download posts you've liked
 - Cookie management: **manual login** with a persistent Chrome profile → exports a Netscape cookie file for yt-dlp/gallery-dl
 - Safety presets and pacing (human-like delays, long breaks)
 - Local SQLite database of downloaded items for dedupe/stats
@@ -105,7 +107,9 @@ python ncinstagramdl.py
 
 ## What Gets Downloaded
 - **DM Download**: downloads shared posts in selected conversations. Profile shares can optionally trigger full profile grabs (depending on options shown in-app).
-- Top-level **Profile / Liked / Saved** entries may indicate "not yet implemented" if those workflows are pending.
+- **Saved Posts Download**: downloads posts from your saved collections and unsorted saved posts, organized into per-collection folders under `downloads/saved/<CollectionName>/` with unsorted posts going to `downloads/saved/_unsorted/`
+- **Liked Posts Download**: downloads posts you've liked, organized under `downloads/liked/`
+- **Profile Posts Download**: downloads all posts from a specific user's profile (not yet implemented)
 
 ### DM Send Message Classification
 When `ASK_FOR_SEND_MESSAGE_APPEND=true` is set in config.txt, the app can detect and use "send messages" from DM conversations to classify downloaded posts:
