@@ -1,6 +1,6 @@
-# NCInstagramDL
+# Social Export Tool
 
-A menu-driven tool for managing Instagram data exports (“profile dumps”) and downloading media. Supports manual, persistent Chrome login with cookie export, optional auto-login with fallback, and DM download workflows.
+A menu-driven tool for managing Instagram data exports (“profile dumps”) and processing media. Supports manual, persistent Chrome login with cookie export, optional auto-login with fallback, and DM workflows.
 
 ## Features
 - Scan and select Instagram **profile dumps** (unzipped exports)
@@ -25,7 +25,8 @@ The app checks for ffmpeg at startup and strongly recommends installing it. With
 ## Installation
 ```sh
 git clone <your-repo-url>
-cd NCInstagramDL
+# Repo name uses hyphen, Python entry script uses underscore
+cd social_export_tool
 # If you keep a requirements.txt, use it; otherwise install packages from the command above.
 ```
 
@@ -37,7 +38,7 @@ PROFILE_DUMP_DIRECTORY=C:\path\to\unzipped\instagram_dump
 DOWNLOAD_DIRECTORY=C:\path\to\downloads
 
 # Chrome user data directory for persistent login. Use a full path (drive included).
-PROFILE_DIR=C:\Users\you\NCInstagramDL\chrome_profile
+PROFILE_DIR=C:\Users\you\social_export_tool\chrome_profile
 
 # Manual vs automatic login
 SAFER_MANUAL_LOGIN=true
@@ -99,7 +100,7 @@ You can also edit individual values (e.g., toggle `SAFER_MANUAL_LOGIN`, change `
 
 ## Running
 ```sh
-python ncinstagramdl.py
+python social_export_tool.py
 ```
 - Choose a profile dump.  
 - Use the options menu (e.g., **DM Download**) when available.  
